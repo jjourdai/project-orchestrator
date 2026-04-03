@@ -4232,7 +4232,22 @@ impl PlanRunner {
                     }
                 }
                 Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
-                    warn!("Runner event receiver lagged by {} events", n);
+                    warn!(
+                        "Runner event receiver lagged by {} events — Result event may have been dropped, aborting listen loop",
+                        n
+                    );
+                    return (
+                        EventListenResult::Completed {
+                            cost_usd,
+                            is_error: true,
+                            error_text: format!(
+                                "Event receiver lagged by {} events — Result event may have been dropped",
+                                n
+                            ),
+                            subtype: "event_lag".to_string(),
+                        },
+                        metrics,
+                    );
                 }
                 Ok(Err(broadcast::error::RecvError::Closed)) => {
                     return (EventListenResult::ChannelClosed { cost_usd }, metrics);
@@ -4250,6 +4265,7 @@ impl PlanRunner {
 // ============================================================================
 
 /// Internal result of the event listening loop.
+#[derive(Debug)]
 enum EventListenResult {
     /// A Result event was received from the agent.
     Completed {
@@ -4578,6 +4594,7 @@ mod tests {
             claude_cli_path: None,
             auto_update_cli: false,
             auto_update_app: false,
+            broadcast_buffer: 2048,
             jwt_secret: None,
             server_port: 0,
             session_token_expiry_secs: 3600,
@@ -4823,6 +4840,61 @@ mod tests {
             _ => panic!("Expected Cancelled variant"),
         }
         reset_globals().await;
+    }
+
+    #[tokio::test]
+    async fn test_listen_for_result_lagged_returns_error() {
+        let runner = test_plan_runner();
+        // Buffer of 1 — sending 3 events will cause the receiver to lag
+        let (tx, mut rx) = broadcast::channel::<ChatEvent>(1);
+        let run_id = Uuid::new_v4();
+
+        // Fill the buffer to force a Lagged error on the receiver
+        let _ = tx.send(ChatEvent::AssistantText {
+            content: "a".into(),
+            parent_tool_use_id: None,
+        });
+        let _ = tx.send(ChatEvent::AssistantText {
+            content: "b".into(),
+            parent_tool_use_id: None,
+        });
+        let _ = tx.send(ChatEvent::AssistantText {
+            content: "c".into(),
+            parent_tool_use_id: None,
+        });
+
+        // The next recv() should return Lagged — but listen_for_result creates
+        // its own receiver from the broadcast::Receiver we pass. We need to
+        // cause the lag on the passed rx. Force it by lagging the existing rx:
+        // Reading after buffer overflow triggers RecvError::Lagged.
+        // Actually, broadcast::Receiver lags when messages were sent while it
+        // existed but it didn't read them. So we just pass the lagged rx directly.
+
+        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+
+        // Pre-lag the receiver by receiving (which will return Lagged)
+        // Then pass a fresh receiver — but we can just test directly:
+        // Actually the simplest approach: overflow happened, rx.recv() will return Lagged.
+        // Pass this lagged rx to listen_for_result.
+        let (result, _metrics) = runner.listen_for_result(rx, run_id, None).await;
+
+        match result {
+            EventListenResult::Completed {
+                is_error,
+                subtype,
+                error_text,
+                ..
+            } => {
+                assert!(is_error, "Expected is_error=true for lagged event");
+                assert_eq!(subtype, "event_lag");
+                assert!(
+                    error_text.contains("lagged"),
+                    "Error text should mention lagging: {}",
+                    error_text
+                );
+            }
+            other => panic!("Expected Completed with event_lag, got {:?}", other),
+        }
     }
 
     // ---------------------------------------------------------------
@@ -5139,6 +5211,7 @@ mod tests {
             claude_cli_path: None,
             auto_update_cli: false,
             auto_update_app: false,
+            broadcast_buffer: 2048,
             jwt_secret: None,
             server_port: 0,
             session_token_expiry_secs: 3600,

@@ -174,6 +174,9 @@ pub struct ChatConfig {
     pub auto_update_cli: bool,
     /// Enable automatic Tauri application updates on startup (default: true).
     pub auto_update_app: bool,
+    /// Broadcast channel buffer size for chat events. Higher values reduce the risk
+    /// of event lag (dropped Result events) when tools produce many rapid StreamDelta events.
+    pub broadcast_buffer: usize,
     /// JWT secret for generating session tokens (MCP auth).
     /// When Some (auth enabled), build_options() generates a session JWT
     /// and injects PO_AUTH_TOKEN + PO_SERVER_URL into the MCP server env.
@@ -250,6 +253,10 @@ impl ChatConfig {
             auto_update_app: std::env::var("CHAT_AUTO_UPDATE_APP")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(true),
+            broadcast_buffer: std::env::var("CHAT_BROADCAST_BUFFER")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2048),
             jwt_secret: None, // Injected from Config.auth_config in lib.rs
             server_port: std::env::var("SERVER_PORT")
                 .ok()
@@ -346,6 +353,7 @@ mod tests {
             claude_cli_path: None,
             auto_update_cli: false,
             auto_update_app: true,
+            broadcast_buffer: 2048,
             jwt_secret: None,
             server_port: 8080,
             session_token_expiry_secs: 86400,
@@ -501,6 +509,7 @@ mod tests {
             claude_cli_path: None,
             auto_update_cli: false,
             auto_update_app: true,
+            broadcast_buffer: 2048,
             jwt_secret: None,
             server_port: 8080,
             session_token_expiry_secs: 86400,
@@ -534,6 +543,7 @@ mod tests {
             claude_cli_path: None,
             auto_update_cli: false,
             auto_update_app: true,
+            broadcast_buffer: 2048,
             jwt_secret: None,
             server_port: 8080,
             session_token_expiry_secs: 86400,

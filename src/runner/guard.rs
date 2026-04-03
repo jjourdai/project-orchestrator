@@ -301,7 +301,15 @@ impl AgentGuard {
                 }
 
                 Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
-                    warn!("Guard event receiver lagged by {} events", n);
+                    warn!(
+                        "Guard: event receiver lagged by {} events — Result event may have been dropped, returning Timeout",
+                        n
+                    );
+                    // If we lagged, we likely missed critical events (including Result).
+                    // Return Timeout so the runner knows the guard can't track this session anymore.
+                    return GuardVerdict::Timeout {
+                        elapsed_secs: start.elapsed().as_secs_f64(),
+                    };
                 }
 
                 Ok(Err(broadcast::error::RecvError::Closed)) => {

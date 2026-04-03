@@ -40,7 +40,8 @@ use uuid::Uuid;
 use crate::expand_tilde;
 
 /// Broadcast channel buffer size for WebSocket subscribers
-const BROADCAST_BUFFER: usize = 256;
+// Broadcast buffer size default is 2048, configurable via CHAT_BROADCAST_BUFFER env var.
+// See ChatConfig.broadcast_buffer.
 
 /// An active chat session with a live Claude CLI subprocess
 pub struct ActiveSession {
@@ -2404,7 +2405,7 @@ impl ChatManager {
         };
 
         // Create broadcast channel early so CompactionNotifier can use the sender
-        let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
+        let (events_tx, _) = broadcast::channel(self.config.broadcast_buffer);
 
         // Create work_log early so CompactionNotifier can reference it
         let work_log = Arc::new(Mutex::new(SessionWorkLog::default()));
@@ -4462,7 +4463,7 @@ impl ChatManager {
             .await;
 
         // Create broadcast channel early so CompactionNotifier can use the sender
-        let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
+        let (events_tx, _) = broadcast::channel(self.config.broadcast_buffer);
 
         // Create work_log early so CompactionNotifier can reference it
         let work_log = Arc::new(Mutex::new(SessionWorkLog::default()));
@@ -5465,6 +5466,7 @@ mod tests {
             claude_cli_path: None,
             auto_update_cli: false,
             auto_update_app: true,
+            broadcast_buffer: 2048,
             jwt_secret: None,
             server_port: 8080,
             session_token_expiry_secs: 86400,
