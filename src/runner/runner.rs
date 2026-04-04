@@ -4846,7 +4846,7 @@ mod tests {
     async fn test_listen_for_result_lagged_returns_error() {
         let runner = test_plan_runner();
         // Buffer of 1 — sending 3 events will cause the receiver to lag
-        let (tx, mut rx) = broadcast::channel::<ChatEvent>(1);
+        let (tx, rx) = broadcast::channel::<ChatEvent>(1);
         let run_id = Uuid::new_v4();
 
         // Fill the buffer to force a Lagged error on the receiver

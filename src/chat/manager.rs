@@ -39,7 +39,6 @@ use uuid::Uuid;
 
 use crate::expand_tilde;
 
-/// Broadcast channel buffer size for WebSocket subscribers
 // Broadcast buffer size default is 2048, configurable via CHAT_BROADCAST_BUFFER env var.
 // See ChatConfig.broadcast_buffer.
 
