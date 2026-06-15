@@ -46,6 +46,16 @@ pub const IGNORED_PATH_SEGMENTS: &[&str] = &[
     // IDE settings
     "/.idea/",
     "/.vscode/",
+    // Python virtualenvs & tooling caches
+    "/venv/",
+    "/.venv/",
+    "/site-packages/",
+    "/.tox/",
+    "/.eggs/",
+    "/.mypy_cache/",
+    "/.pytest_cache/",
+    "/.ruff_cache/",
+    "/__pycache__/",
 ];
 
 /// Check whether a file path should be ignored during sync.
@@ -141,6 +151,32 @@ mod tests {
         // But similar names without dots should NOT be caught
         assert!(!should_ignore_path("/project/src/idea/module.rs"));
         assert!(!should_ignore_path("/project/src/vscode/extension.ts"));
+    }
+
+    #[test]
+    fn test_should_ignore_python_virtualenvs() {
+        // Standard virtualenv directory names
+        assert!(should_ignore_path(
+            "/project/venv/lib/python3.11/site-packages/requests/api.py"
+        ));
+        assert!(should_ignore_path(
+            "/project/.venv/lib/python3.11/site-packages/flask/app.py"
+        ));
+        // site-packages catches any virtualenv regardless of its dir name
+        assert!(should_ignore_path(
+            "/project/myenv/lib/python3.12/site-packages/numpy/core.py"
+        ));
+        // Tooling caches
+        assert!(should_ignore_path("/project/.tox/py311/lib/foo.py"));
+        assert!(should_ignore_path("/project/.mypy_cache/3.11/foo.json"));
+        assert!(should_ignore_path(
+            "/project/.pytest_cache/v/cache/lastfailed"
+        ));
+        assert!(should_ignore_path("/project/.ruff_cache/0.1.0/foo"));
+        assert!(should_ignore_path("/project/.eggs/setuptools.egg/foo.py"));
+        // But legitimate source files should NOT be caught
+        assert!(!should_ignore_path("/project/src/venvironment.py"));
+        assert!(!should_ignore_path("/project/src/event.py"));
     }
 
     #[test]
