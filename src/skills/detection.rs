@@ -880,7 +880,7 @@ pub async fn detect_skills_pipeline(
             limit: Some(max_notes),
             ..Default::default()
         };
-        let (notes, _) = graph_store
+        let (mut notes, _) = graph_store
             .list_notes(Some(project_id), None, &filters)
             .await?;
         if notes.len() >= max_notes as usize {
@@ -891,6 +891,35 @@ pub async fn detect_skills_pipeline(
                 max_notes
             );
         }
+
+        // HYDRATE ANCHORS — do not remove.
+        //
+        // `list_notes` runs `RETURN n` and never collects LINKED_TO targets, so
+        // every note above arrives with an EMPTY `anchors` vec no matter what
+        // the graph holds. This corpus is the DENOMINATOR for FileGlob trigger
+        // quality: `evaluate_file_glob_quality` counts project-wide notes whose
+        // anchors match the glob. Unhydrated, that count is structurally 0,
+        // `compute_f1` short-circuits to Some(0.0), and the
+        // `retain(|t| t.is_reliable())` gate (>= 0.3) culls EVERY FileGlob at
+        // genesis. Since FileGlob is the only trigger kind that realistically
+        // survives here, skills were persisted with `trigger_patterns: []` and
+        // could never activate — then archived for a 0.0 hit rate.
+        let note_ids: Vec<Uuid> = notes.iter().map(|n| n.id).collect();
+        let mut anchors_by_note = graph_store.get_note_anchors_batch(&note_ids).await?;
+        let mut hydrated = 0usize;
+        for note in &mut notes {
+            if let Some(anchors) = anchors_by_note.remove(&note.id) {
+                note.anchors = anchors;
+                hydrated += 1;
+            }
+        }
+        tracing::debug!(
+            project_id = %project_id,
+            notes = notes.len(),
+            hydrated,
+            "Trigger-quality corpus: hydrated note anchors"
+        );
+
         notes
     };
 

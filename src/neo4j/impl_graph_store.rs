@@ -1950,6 +1950,13 @@ impl GraphStore for Neo4jClient {
         self.get_note_anchors(note_id).await
     }
 
+    async fn get_note_anchors_batch(
+        &self,
+        note_ids: &[Uuid],
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, Vec<NoteAnchor>>> {
+        self.get_note_anchors_batch(note_ids).await
+    }
+
     async fn set_note_embedding(
         &self,
         note_id: Uuid,

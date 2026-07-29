@@ -1531,6 +1531,23 @@ pub trait GraphStore: Send + Sync {
     /// Get anchors for a note
     async fn get_note_anchors(&self, note_id: Uuid) -> Result<Vec<NoteAnchor>>;
 
+    /// Get anchors for MANY notes in a single query (batch form of
+    /// `get_note_anchors`, avoiding N+1).
+    ///
+    /// Needed because `list_notes` returns `RETURN n` only and therefore yields
+    /// notes with an EMPTY `anchors` vec regardless of what the graph holds —
+    /// only `get_note` and `get_skill_members` hydrate anchors inline. Any
+    /// caller that lists notes and then reasons about their anchors MUST
+    /// hydrate explicitly or it will silently see nothing. (Skill FileGlob
+    /// trigger quality was scored against an unhydrated corpus, which made
+    /// every glob score 0.0 and be culled — see `evaluate_file_glob_quality`.)
+    ///
+    /// Notes with no anchors are simply absent from the returned map.
+    async fn get_note_anchors_batch(
+        &self,
+        note_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<NoteAnchor>>>;
+
     /// Store a vector embedding on a Note node.
     ///
     /// Uses `db.create.setNodeVectorProperty` to ensure the correct type

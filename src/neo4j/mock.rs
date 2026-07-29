@@ -5909,6 +5909,22 @@ impl GraphStore for MockGraphStore {
             .unwrap_or_default())
     }
 
+    async fn get_note_anchors_batch(
+        &self,
+        note_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<NoteAnchor>>> {
+        let store = self.note_anchors.read().await;
+        let mut out = std::collections::HashMap::new();
+        for id in note_ids {
+            if let Some(anchors) = store.get(id) {
+                if !anchors.is_empty() {
+                    out.insert(*id, anchors.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
     async fn set_note_embedding(
         &self,
         note_id: Uuid,

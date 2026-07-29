@@ -1943,6 +1943,71 @@ impl Neo4jClient {
         Ok(anchors)
     }
 
+    /// Batch form of `get_note_anchors` — one query for many notes (no N+1).
+    ///
+    /// `list_notes` does `RETURN n` and never collects LINKED_TO targets, so
+    /// notes it returns always carry an empty `anchors` vec. Callers that list
+    /// notes and then read anchors must hydrate through this.
+    pub async fn get_note_anchors_batch(
+        &self,
+        note_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<NoteAnchor>>> {
+        use std::collections::HashMap;
+
+        if note_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let ids: Vec<String> = note_ids.iter().map(|id| id.to_string()).collect();
+
+        let q = query(
+            r#"
+            UNWIND $ids AS nid
+            MATCH (n:Note {id: nid})-[r:LINKED_TO]->(e)
+            RETURN nid AS note_id,
+                   labels(e)[0] AS entity_type,
+                   coalesce(e.id, e.path, e.hash) AS entity_id,
+                   r.signature_hash AS sig_hash,
+                   r.body_hash AS body_hash,
+                   r.last_verified AS last_verified
+            "#,
+        )
+        .param("ids", ids);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut out: HashMap<Uuid, Vec<NoteAnchor>> = HashMap::new();
+
+        while let Some(row) = result.next().await? {
+            let note_id_str: String = row.get("note_id")?;
+            let Ok(note_id) = note_id_str.parse::<Uuid>() else {
+                continue;
+            };
+            let entity_type_str: String = row.get("entity_type")?;
+            let entity_id: String = row.get("entity_id")?;
+            let sig_hash: Option<String> = row.get("sig_hash").ok();
+            let body_hash: Option<String> = row.get("body_hash").ok();
+            let last_verified: String = row
+                .get::<String>("last_verified")
+                .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339());
+
+            let entity_type = entity_type_str
+                .to_lowercase()
+                .parse::<EntityType>()
+                .unwrap_or(EntityType::File);
+
+            out.entry(note_id).or_default().push(NoteAnchor {
+                entity_type,
+                entity_id,
+                signature_hash: sig_hash.filter(|s| !s.is_empty()),
+                body_hash: body_hash.filter(|s| !s.is_empty()),
+                last_verified: last_verified.parse().unwrap_or_else(|_| chrono::Utc::now()),
+                is_valid: true,
+            });
+        }
+
+        Ok(out)
+    }
+
     /// Store a vector embedding on a Note node.
     ///
     /// Uses `db.create.setNodeVectorProperty` to ensure the correct type
