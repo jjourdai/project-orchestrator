@@ -594,10 +594,37 @@ fn match_regex_trigger(trigger_pattern: &str, input: &str) -> bool {
 ///
 /// Returns true if the glob matches, false otherwise.
 fn match_file_glob_trigger(trigger_pattern: &str, file_path: &str) -> bool {
-    match glob::Pattern::new(trigger_pattern) {
-        Ok(pat) => pat.matches(file_path),
-        Err(_) => false,
+    let Ok(pat) = glob::Pattern::new(trigger_pattern) else {
+        return false;
+    };
+
+    if pat.matches(file_path) {
+        return true;
     }
+
+    // Stored patterns are project-RELATIVE (`backend/crates/**`) so a skill stays
+    // portable when exported to another machine, but a path arriving from a tool
+    // call is ABSOLUTE (`/Users/me/repo/backend/crates/api/src/main.rs`). Matching
+    // the two directly always failed, so FileGlob triggers could never fire even
+    // when they were correct.
+    //
+    // Retry against each suffix of the path that begins on a segment boundary.
+    // This needs no project root at match time, which keeps the hook hot-path
+    // config-free. It is deliberately a little permissive — a relative pattern can
+    // match the same directory layout under a different root — which is the right
+    // trade for a context-injection trigger: over-firing costs a little context,
+    // never firing costs the whole feature.
+    if trigger_pattern.starts_with('/') {
+        return false;
+    }
+    let mut rest = file_path;
+    while let Some(idx) = rest.find('/') {
+        rest = &rest[idx + 1..];
+        if pat.matches(rest) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Match an MCP action trigger against an extracted MCP pattern.
@@ -1776,6 +1803,30 @@ mod tests {
         assert!(match_file_glob_trigger(
             "src/neo4j/*",
             "src/neo4j/client.rs"
+        ));
+    }
+
+    /// A relative stored pattern must match the absolute path a tool call
+    /// supplies, otherwise no FileGlob trigger can ever fire at runtime.
+    #[test]
+    fn test_match_file_glob_trigger_relative_pattern_vs_absolute_path() {
+        assert!(match_file_glob_trigger(
+            "backend/crates/**",
+            "/Users/me/repo/backend/crates/api/src/main.rs"
+        ));
+        assert!(match_file_glob_trigger(
+            "src/neo4j/**",
+            "/Users/me/project-orchestrator/src/neo4j/note.rs"
+        ));
+        // Still discriminating: a different subtree must not match.
+        assert!(!match_file_glob_trigger(
+            "backend/crates/**",
+            "/Users/me/repo/frontend/src/lib/api.ts"
+        ));
+        // An absolute pattern keeps strict semantics.
+        assert!(!match_file_glob_trigger(
+            "/Users/other/repo/backend/**",
+            "/Users/me/repo/backend/x.rs"
         ));
     }
 

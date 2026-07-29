@@ -835,13 +835,19 @@ pub fn evaluate_trigger_quality(
     trigger: &SkillTrigger,
     skill_notes: &[Note],
     all_project_notes: &[Note],
+    root_path: Option<&str>,
 ) -> Option<f64> {
     match trigger.pattern_type {
         TriggerType::Regex => {
             evaluate_regex_quality(&trigger.pattern_value, skill_notes, all_project_notes)
         }
         TriggerType::FileGlob => {
-            evaluate_file_glob_quality(&trigger.pattern_value, skill_notes, all_project_notes)
+            evaluate_file_glob_quality(
+                &trigger.pattern_value,
+                skill_notes,
+                all_project_notes,
+                root_path,
+            )
         }
         TriggerType::McpAction => None, // McpAction triggers are simple prefix match, no quality metric
         TriggerType::Semantic => None,  // Semantic triggers are evaluated at activation time
@@ -952,6 +958,7 @@ fn evaluate_file_glob_quality(
     pattern: &str,
     skill_notes: &[Note],
     all_project_notes: &[Note],
+    root_path: Option<&str>,
 ) -> Option<f64> {
     let glob = glob::Pattern::new(pattern).ok()?;
 
@@ -972,13 +979,13 @@ fn evaluate_file_glob_quality(
     // Count skill notes with at least one matching file anchor
     let skill_matches = skill_notes
         .iter()
-        .filter(|n| note_matches_glob(n, &glob))
+        .filter(|n| note_matches_glob(n, &glob, root_path))
         .count();
 
     // Count all project notes with at least one matching file anchor
     let all_matches = all_project_notes
         .iter()
-        .filter(|n| note_matches_glob(n, &glob))
+        .filter(|n| note_matches_glob(n, &glob, root_path))
         .count();
 
     // Skill notes are a subset of the project, so project-wide matches can never
@@ -1030,10 +1037,23 @@ fn evaluate_file_glob_quality(
 }
 
 /// Check if a note has any file anchor matching a glob pattern.
-fn note_matches_glob(note: &Note, glob: &glob::Pattern) -> bool {
+fn note_matches_glob(note: &Note, glob: &glob::Pattern, root_path: Option<&str>) -> bool {
     note.anchors
         .iter()
-        .any(|a| a.entity_type == crate::notes::EntityType::File && glob.matches(&a.entity_id))
+        .filter(|a| a.entity_type == crate::notes::EntityType::File)
+        .any(|a| {
+            // Patterns are built from RELATIVIZED anchor paths (see
+            // `generate_file_glob_triggers`) so that a stored trigger is portable
+            // across machines. Anchors themselves are absolute. Matching the
+            // pattern against the raw anchor therefore never matched — which is
+            // why `skill_matches` was 0 even for a glob derived from these very
+            // anchors, driving every FileGlob to quality 0 and culling it.
+            // Relativize the SAME way here so both sides speak one path language.
+            match root_path {
+                Some(root) => glob.matches(&relativize(&a.entity_id, root)),
+                None => glob.matches(&a.entity_id),
+            }
+        })
 }
 
 /// Compute F1 score from match counts.
@@ -1134,7 +1154,8 @@ pub fn generate_all_triggers(
         "FileGlob generation: candidates before scoring"
     );
     for trigger in &mut file_globs {
-        trigger.quality_score = evaluate_trigger_quality(trigger, skill_notes, all_project_notes);
+        trigger.quality_score =
+            evaluate_trigger_quality(trigger, skill_notes, all_project_notes, root_path);
     }
     // Genesis reliability gate: drop unreliable triggers (quality < 0.3) at generation
     // time so they are never stored. This relocates the is_reliable filter off the
@@ -1146,7 +1167,8 @@ pub fn generate_all_triggers(
     // 2. Regex from tags and content (with IDF against all project notes)
     let mut regex_triggers = generate_regex_triggers(skill_notes, all_project_notes);
     for trigger in &mut regex_triggers {
-        trigger.quality_score = evaluate_trigger_quality(trigger, skill_notes, all_project_notes);
+        trigger.quality_score =
+            evaluate_trigger_quality(trigger, skill_notes, all_project_notes, root_path);
     }
     // Genesis reliability gate (see FileGlob above).
     regex_triggers.retain(|t| t.is_reliable());
@@ -1301,6 +1323,43 @@ mod tests {
         );
     }
 
+    /// Regression: the pattern is built from RELATIVIZED anchor paths while the
+    /// anchors themselves are absolute. Matching the two directly yielded
+    /// skill_matches = 0 for a glob derived from those very anchors — observed
+    /// live as `pattern="backend/**" skill_matches=0 all_matches=0 total_skill=7`
+    /// — so every FileGlob scored 0 and was culled. Quality evaluation must
+    /// relativize the same way the pattern was built.
+    #[test]
+    fn test_file_glob_quality_matches_absolute_anchors_via_root_path() {
+        let root = "/Users/me/repo";
+        let skill_notes: Vec<Note> = (0..6)
+            .map(|i| {
+                make_note_with_anchors(
+                    vec!["api"],
+                    "n",
+                    vec![file_anchor(&format!("{}/backend/crates/api/f{}.rs", root, i))],
+                )
+            })
+            .collect();
+        let all_notes = skill_notes.clone();
+
+        // Without a root the absolute anchors cannot match a relative pattern.
+        assert_eq!(
+            evaluate_file_glob_quality("backend/**", &skill_notes, &all_notes, None),
+            Some(0.0),
+            "relative pattern vs absolute anchor must not match without a root"
+        );
+
+        // With the root, it matches and recall is full.
+        let q = evaluate_file_glob_quality("backend/**", &skill_notes, &all_notes, Some(root))
+            .expect("should score");
+        assert!(
+            q >= 0.99,
+            "expected full recall once anchors are relativized, got {}",
+            q
+        );
+    }
+
     /// A glob covering essentially the whole corpus carries no signal and must
     /// still be rejected — recall-based scoring must not become "accept
     /// everything".
@@ -1327,7 +1386,7 @@ mod tests {
             .chain(skill_notes.iter().cloned())
             .collect();
 
-        let quality = evaluate_file_glob_quality("src/**", &skill_notes, &all_notes);
+        let quality = evaluate_file_glob_quality("src/**", &skill_notes, &all_notes, None);
         assert_eq!(
             quality,
             Some(0.0),
@@ -1689,7 +1748,7 @@ mod tests {
         let all_notes = skill_notes.clone();
 
         let trigger = SkillTrigger::regex("neo4j", 0.7);
-        let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes);
+        let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes, None);
 
         // P=3/3=1.0, R=3/3=1.0, F1=1.0
         assert!(quality.is_some());
@@ -1718,7 +1777,7 @@ mod tests {
         }
 
         let trigger = SkillTrigger::regex("api", 0.7);
-        let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes);
+        let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes, None);
 
         // P=2/10=0.2, R=2/2=1.0, F1=2*(0.2*1.0)/(0.2+1.0)=0.333
         assert!(quality.is_some());
@@ -1742,7 +1801,7 @@ mod tests {
         let all_notes = skill_notes.clone();
 
         let trigger = SkillTrigger::regex("obscure_term", 0.7);
-        let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes);
+        let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes, None);
 
         // P=1/1=1.0, R=1/5=0.2, F1=2*(1.0*0.2)/(1.0+0.2)=0.333
         assert!(quality.is_some());
@@ -1768,7 +1827,7 @@ mod tests {
         ));
 
         let trigger = SkillTrigger::file_glob("src/api/**", 0.7);
-        let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes);
+        let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes, None);
 
         // P=2/2=1.0, R=2/2=1.0, F1=1.0
         assert!(quality.is_some());
@@ -1782,7 +1841,7 @@ mod tests {
     #[test]
     fn test_semantic_trigger_no_quality() {
         let trigger = SkillTrigger::semantic("[0.1, 0.2]", 0.75);
-        let quality = evaluate_trigger_quality(&trigger, &[], &[]);
+        let quality = evaluate_trigger_quality(&trigger, &[], &[], None);
         assert!(
             quality.is_none(),
             "Semantic triggers should have no quality score"
