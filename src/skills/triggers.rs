@@ -918,6 +918,36 @@ fn note_matches_regex(note: &Note, regex: &regex::Regex) -> bool {
 }
 
 /// Evaluate file glob trigger quality against note file anchors.
+/// A glob matching more than this share of the project's notes is degenerate —
+/// it would fire on almost everything and carries no signal.
+const MAX_GLOB_CORPUS_COVERAGE: f64 = 0.60;
+
+/// Coverage is only meaningful once the corpus is big enough for the ratio to
+/// mean something; on a handful of notes it is noise.
+const MIN_CORPUS_FOR_COVERAGE: usize = 50;
+
+/// Quality of a FileGlob trigger.
+///
+/// This is deliberately NOT an F1 score. F1 weights precision — here
+/// `skill_matches / all_matches`, i.e. "of every project note touching this
+/// glob, how many belong to THIS skill?" With a few dozen notes per skill in a
+/// corpus of thousands, that ratio is a couple of percent no matter how good
+/// the trigger is; measured on a real project it was 0.0248, giving F1 = 0.048
+/// against a 0.3 gate. Every FileGlob was therefore culled at generation, on
+/// every project, leaving skills with no triggers and no way to activate.
+/// Re-weighting does not rescue it either (F2 = 0.108, F3 = 0.187) — precision
+/// against the whole note corpus is a clustering-purity measure, not a measure
+/// of whether a trigger is useful.
+///
+/// The question a trigger must answer is "the agent is touching a file matching
+/// this glob — is this skill worth injecting?" For that, RECALL is the signal:
+/// does the glob cover the skill's own notes? The only real failure mode is a
+/// degenerate glob that matches everything, which is handled by an explicit
+/// coverage cap rather than by penalising precision.
+///
+/// The asymmetry justifies it: a trigger firing slightly too often costs a
+/// little extra context; a trigger that never fires makes the whole skills
+/// system inert.
 fn evaluate_file_glob_quality(
     pattern: &str,
     skill_notes: &[Note],
@@ -951,7 +981,32 @@ fn evaluate_file_glob_quality(
         .filter(|n| note_matches_glob(n, &glob))
         .count();
 
-    compute_f1(skill_matches, all_matches, total_skill)
+    // Skill notes are a subset of the project, so project-wide matches can never
+    // be fewer. When they are, the corpus handed to us is wrong — classically an
+    // unhydrated one, since `list_notes` returns notes with empty `anchors`.
+    // Report unknown (treated as reliable) and make it visible rather than
+    // silently scoring zero and emptying the trigger set.
+    if all_matches < skill_matches {
+        tracing::warn!(
+            pattern,
+            skill_matches,
+            all_matches,
+            "FileGlob quality: project-wide matches < skill matches — corpus is \
+             inconsistent (unhydrated note anchors?); treating quality as unknown"
+        );
+        return None;
+    }
+
+    // Reject degenerate globs that would fire on essentially every file.
+    if all_project_notes.len() >= MIN_CORPUS_FOR_COVERAGE {
+        let coverage = all_matches as f64 / all_project_notes.len() as f64;
+        if coverage > MAX_GLOB_CORPUS_COVERAGE {
+            return Some(0.0);
+        }
+    }
+
+    // Recall: how much of the skill's own footprint this glob covers.
+    Some(skill_matches as f64 / total_skill as f64)
 }
 
 /// Check if a note has any file anchor matching a glob pattern.
@@ -1122,6 +1177,117 @@ mod tests {
 
     fn file_anchor(path: &str) -> NoteAnchor {
         NoteAnchor::new(EntityType::File, path.to_string())
+    }
+
+    /// Reproduce the real shape observed on project `gonnado`: a skill whose
+    /// member notes span backend + frontend + infra, inside a large corpus.
+    /// Returns (skill_notes, all_project_notes).
+    fn realistic_corpus() -> (Vec<Note>, Vec<Note>) {
+        let skill_files = [
+            "backend/crates/api/src/main.rs",
+            "backend/crates/api/src/dto.rs",
+            "backend/crates/domain/src/organiser_profile.rs",
+            "backend/crates/neo4j-repo/src/lib.rs",
+            "frontend/src/lib/api.ts",
+            "infra/terraform/dns.tf",
+        ];
+        let skill_notes: Vec<Note> = (0..26)
+            .map(|i| {
+                make_note_with_anchors(
+                    vec!["api", "auth"],
+                    "api auth note",
+                    vec![file_anchor(skill_files[i % skill_files.len()])],
+                )
+            })
+            .collect();
+
+        // ~1800-note corpus over the same tree, as in the real project.
+        let corpus_files = [
+            "backend/crates/api/src/main.rs",
+            "backend/crates/api/src/handlers.rs",
+            "backend/crates/ingestion/src/lib.rs",
+            "backend/crates/domain/src/model.rs",
+            "frontend/src/lib/api.ts",
+            "frontend/src/lib/i18n.ts",
+            "frontend/src/lib/components/EventDetail.svelte",
+            "infra/terraform/api.tf",
+            "infra/terraform/cognito.tf",
+            "tests/api/organiser.hurl",
+        ];
+        let mut all: Vec<Note> = skill_notes.clone();
+        for i in 0..1771 {
+            all.push(make_note_with_anchors(
+                vec!["misc"],
+                "other note",
+                vec![file_anchor(corpus_files[i % corpus_files.len()])],
+            ));
+        }
+        (skill_notes, all)
+    }
+
+    /// A realistic skill must end up with a usable FileGlob trigger.
+    ///
+    /// Measured on the real `gonnado` project this glob scored precision 0.0248
+    /// / recall 0.6923 — F1 0.048, F2 0.108, F3 0.187, all under the 0.3 gate.
+    /// That is why every skill had `trigger_patterns: []` and none could ever
+    /// activate. Recall-based scoring keeps it.
+    #[test]
+    fn test_realistic_skill_keeps_a_file_glob_trigger() {
+        let (skill_notes, all_notes) = realistic_corpus();
+
+        let result = generate_all_triggers(&skill_notes, &all_notes, &HashMap::new(), None);
+
+        assert!(
+            result.file_glob_count > 0,
+            "a realistic skill must retain at least one FileGlob trigger, got {:?}",
+            result.triggers
+        );
+
+        let glob = result
+            .triggers
+            .iter()
+            .find(|t| t.pattern_type == TriggerType::FileGlob)
+            .expect("FileGlob trigger present");
+        assert!(
+            glob.is_reliable(),
+            "glob {} must clear the reliability gate, quality={:?}",
+            glob.pattern_value,
+            glob.quality_score
+        );
+    }
+
+    /// A glob covering essentially the whole corpus carries no signal and must
+    /// still be rejected — recall-based scoring must not become "accept
+    /// everything".
+    #[test]
+    fn test_degenerate_glob_matching_whole_corpus_is_rejected() {
+        let skill_notes: Vec<Note> = (0..30)
+            .map(|i| {
+                make_note_with_anchors(
+                    vec!["x"],
+                    "n",
+                    vec![file_anchor(&format!("src/mod{}/file.rs", i % 5))],
+                )
+            })
+            .collect();
+        // Every project note lives under src/, so `src/**` covers 100%.
+        let all_notes: Vec<Note> = (0..200)
+            .map(|i| {
+                make_note_with_anchors(
+                    vec!["y"],
+                    "n",
+                    vec![file_anchor(&format!("src/other{}/file.rs", i % 40))],
+                )
+            })
+            .chain(skill_notes.iter().cloned())
+            .collect();
+
+        let quality = evaluate_file_glob_quality("src/**", &skill_notes, &all_notes);
+        assert_eq!(
+            quality,
+            Some(0.0),
+            "a glob matching the whole corpus must score 0.0"
+        );
     }
 
     // ================================================================
