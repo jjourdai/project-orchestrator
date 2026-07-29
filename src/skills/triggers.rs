@@ -965,6 +965,28 @@ fn note_matches_glob(note: &Note, glob: &glob::Pattern) -> bool {
 /// precision = true_positives / all_positives
 /// recall = true_positives / total_relevant
 fn compute_f1(true_positives: usize, all_positives: usize, total_relevant: usize) -> Option<f64> {
+    // `all_positives` counts matches across the WHOLE project corpus, and the
+    // skill's notes are a subset of it — so it can never be smaller than
+    // `true_positives`. When it is, the corpus we were handed is wrong (the
+    // classic cause: notes fetched via `list_notes`, which returns `RETURN n`
+    // and leaves `anchors` empty, used as the FileGlob quality denominator).
+    //
+    // Scoring that as 0.0 is what silently culled every FileGlob trigger at
+    // genesis and left skills unable to activate. Return None instead —
+    // "quality unknown", which `is_reliable()` treats as reliable — and make
+    // the corruption visible rather than letting it quietly empty the trigger
+    // set.
+    if all_positives < true_positives {
+        tracing::warn!(
+            true_positives,
+            all_positives,
+            total_relevant,
+            "Trigger quality: project-wide matches < skill matches — corpus is \
+             inconsistent (unhydrated note anchors?); treating quality as unknown"
+        );
+        return None;
+    }
+
     if all_positives == 0 || total_relevant == 0 {
         return Some(0.0);
     }
@@ -2159,6 +2181,78 @@ mod tests {
             pattern.contains("rust"),
             "Expected 'rust' (discriminative in Python project) in pattern, got: {}",
             pattern
+        );
+    }
+
+    // ========================================================================
+    // Regression: FileGlob triggers were culled at genesis on every project
+    // ========================================================================
+
+    /// `all_positives` counts project-wide matches; the skill's notes are a
+    /// subset of the project, so it can never be below `true_positives`. That
+    /// state means the corpus is broken — historically, notes fetched via
+    /// `list_notes` (which does `RETURN n` and leaves `anchors` empty) were used
+    /// as the FileGlob quality denominator, making `all_positives` structurally
+    /// 0. It used to score 0.0, which failed the `is_reliable()` >= 0.3 gate and
+    /// culled every glob. It must now report unknown, not zero.
+    #[test]
+    fn test_compute_f1_rejects_impossible_counts_instead_of_scoring_zero() {
+        assert_eq!(
+            compute_f1(3, 0, 5),
+            None,
+            "project-wide matches below skill matches must be 'unknown', not 0.0"
+        );
+
+        // A genuine zero-match case is still a real 0.0, not None.
+        assert_eq!(compute_f1(0, 0, 5), Some(0.0));
+
+        // And a well-formed corpus still scores normally.
+        let score = compute_f1(3, 4, 5).expect("well-formed counts should score");
+        assert!(score > 0.0 && score <= 1.0, "unexpected F1: {}", score);
+    }
+
+    /// End-to-end: with a properly hydrated project corpus, FileGlob triggers
+    /// survive generation. Before the fix the corpus arrived with empty anchors
+    /// and every glob was dropped, leaving `trigger_patterns: []` on every
+    /// detected skill — so the skill could never match and was archived for a
+    /// 0.0 hit rate it had no way to earn.
+    #[test]
+    fn test_file_glob_triggers_survive_with_hydrated_corpus() {
+        let skill_notes = vec![
+            make_note_with_anchors(
+                vec!["api"],
+                "route parity",
+                vec![file_anchor("src/api/routes.rs")],
+            ),
+            make_note_with_anchors(
+                vec!["api"],
+                "handler dispatch",
+                vec![file_anchor("src/api/handlers.rs")],
+            ),
+        ];
+
+        // The wider project corpus WITH anchors — this is what was missing.
+        let mut all_notes = skill_notes.clone();
+        all_notes.push(make_note_with_anchors(
+            vec!["ui"],
+            "unrelated",
+            vec![file_anchor("src/ui/button.rs")],
+        ));
+
+        let result = generate_all_triggers(&skill_notes, &all_notes, &HashMap::new(), None);
+
+        assert!(
+            result.file_glob_count > 0,
+            "expected FileGlob triggers to survive the reliability gate, got {:?}",
+            result.triggers
+        );
+        assert!(
+            result
+                .triggers
+                .iter()
+                .any(|t| t.pattern_type == TriggerType::FileGlob),
+            "no FileGlob trigger present in {:?}",
+            result.triggers
         );
     }
 }
