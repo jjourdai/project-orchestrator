@@ -1001,12 +1001,32 @@ fn evaluate_file_glob_quality(
     if all_project_notes.len() >= MIN_CORPUS_FOR_COVERAGE {
         let coverage = all_matches as f64 / all_project_notes.len() as f64;
         if coverage > MAX_GLOB_CORPUS_COVERAGE {
+            tracing::info!(
+                pattern,
+                skill_matches,
+                all_matches,
+                corpus = all_project_notes.len(),
+                coverage = format!("{:.3}", coverage),
+                cap = MAX_GLOB_CORPUS_COVERAGE,
+                "FileGlob REJECTED as degenerate (corpus coverage over cap)"
+            );
             return Some(0.0);
         }
     }
 
     // Recall: how much of the skill's own footprint this glob covers.
-    Some(skill_matches as f64 / total_skill as f64)
+    let recall = skill_matches as f64 / total_skill as f64;
+    tracing::info!(
+        pattern,
+        skill_matches,
+        all_matches,
+        total_skill,
+        corpus = all_project_notes.len(),
+        recall = format!("{:.3}", recall),
+        kept = recall >= 0.3,
+        "FileGlob scored"
+    );
+    Some(recall)
 }
 
 /// Check if a note has any file anchor matching a glob pattern.
@@ -1088,6 +1108,31 @@ pub fn generate_all_triggers(
 
     // 1. FileGlob from file anchors (with distinctiveness against project)
     let mut file_globs = generate_file_glob_triggers(skill_notes, all_project_notes, root_path);
+    let candidates_generated = file_globs.len();
+    let anchored_skill_notes = skill_notes
+        .iter()
+        .filter(|n| {
+            n.anchors
+                .iter()
+                .any(|a| a.entity_type == EntityType::File)
+        })
+        .count();
+    let anchored_corpus_notes = all_project_notes
+        .iter()
+        .filter(|n| {
+            n.anchors
+                .iter()
+                .any(|a| a.entity_type == EntityType::File)
+        })
+        .count();
+    tracing::info!(
+        candidates_generated,
+        skill_notes = skill_notes.len(),
+        anchored_skill_notes,
+        corpus_notes = all_project_notes.len(),
+        anchored_corpus_notes,
+        "FileGlob generation: candidates before scoring"
+    );
     for trigger in &mut file_globs {
         trigger.quality_score = evaluate_trigger_quality(trigger, skill_notes, all_project_notes);
     }
