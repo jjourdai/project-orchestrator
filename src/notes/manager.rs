@@ -259,9 +259,17 @@ impl NoteManager {
             // Resolve project root_path for absolute file path matching.
             // File nodes use absolute paths, but extract_file_paths_from_content
             // returns relative — we need root_path to bridge the gap.
+            //
+            // Expand `~` for the same reason the batch path does
+            // (`skills::activation::auto_anchor_notes_for_project`): a stored
+            // root_path like `~/projects/app` yields `/~/...` candidates that
+            // never match, AND degrades `link_note_to_entity` from an
+            // index-backed exact MATCH on File.path into a full-label-scan
+            // `ENDS WITH` — one CPU-bound scan per note×path. Both call sites
+            // must resolve root_path identically.
             let root_path = if let Some(pid) = note_clone.project_id {
                 match neo4j.get_project(pid).await {
-                    Ok(Some(proj)) => Some(proj.root_path),
+                    Ok(Some(proj)) => Some(crate::expand_tilde(&proj.root_path)),
                     _ => None,
                 }
             } else {
