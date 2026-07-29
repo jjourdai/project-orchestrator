@@ -1334,17 +1334,48 @@ pub async fn auto_anchor_notes_for_project(
         }
     };
 
-    let filters = NoteFilters::default();
-    let (notes, _total) = graph_store
-        .list_notes(Some(project_id), None, &filters)
-        .await?;
+    // Page explicitly through EVERY note. `NoteFilters::default()` leaves
+    // `limit: None`, which the Neo4j layer resolves to `unwrap_or(50)` with a
+    // default `created_at DESC` sort — so a single unpaginated call only ever
+    // sees the 50 most-recent notes, and repeated invocations re-scan that same
+    // page forever. Anything older is unreachable, which starves
+    // `generate_file_glob_triggers` (it early-returns when notes carry no file
+    // anchors) and leaves every detected skill with empty `trigger_patterns`.
+    const PAGE_SIZE: i64 = 200;
 
-    let notes_count = notes.len();
+    let mut notes_count = 0usize;
     let mut total_anchors = 0;
+    let mut offset = 0i64;
 
-    for note in &notes {
-        let anchored = auto_anchor_note(graph_store, note, root_path.as_deref()).await?;
-        total_anchors += anchored;
+    loop {
+        let filters = NoteFilters {
+            limit: Some(PAGE_SIZE),
+            offset: Some(offset),
+            // Stable ordering across pages: `created_at DESC` is the default and
+            // notes are append-mostly, but pinning it here makes the traversal
+            // independent of any future change to the default sort.
+            sort_by: Some("created_at".to_string()),
+            sort_order: Some("desc".to_string()),
+            ..Default::default()
+        };
+
+        let (notes, _total) = graph_store
+            .list_notes(Some(project_id), None, &filters)
+            .await?;
+
+        let page_len = notes.len();
+        notes_count += page_len;
+
+        for note in &notes {
+            let anchored = auto_anchor_note(graph_store, note, root_path.as_deref()).await?;
+            total_anchors += anchored;
+        }
+
+        // A short page means we reached the end of the corpus.
+        if (page_len as i64) < PAGE_SIZE {
+            break;
+        }
+        offset += PAGE_SIZE;
     }
 
     tracing::info!(
@@ -4414,5 +4445,68 @@ mod tests {
         assert_eq!(json["notes_processed"], 10);
         assert_eq!(json["affects_created"], 2);
         assert_eq!(json["elapsed_ms"], 42);
+    }
+
+    /// Regression: the batch anchorer must page through the WHOLE corpus.
+    ///
+    /// `NoteFilters::default()` leaves `limit: None`, which both the Neo4j layer
+    /// (`neo4j/note.rs`) and the mock resolve to `unwrap_or(50)`. Before the
+    /// pagination fix, a single unpaginated `list_notes` call meant only the 50
+    /// most-recent notes were ever anchored — and because there was no offset,
+    /// repeated invocations re-scanned that same page forever, so older notes
+    /// could never acquire file anchors at any call count. Empty anchors then
+    /// starve `generate_file_glob_triggers` (it early-returns when no note
+    /// carries a File anchor), leaving every detected skill with empty
+    /// `trigger_patterns` and therefore unable to ever activate.
+    #[tokio::test]
+    async fn test_auto_anchor_notes_for_project_pages_beyond_default_limit() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test-project".to_string(),
+            slug: "test-project".to_string(),
+            description: None,
+            root_path: "/tmp/test-project".to_string(),
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+            watch_enabled: true,
+        };
+        store.create_project(&project).await.unwrap();
+
+        // Deliberately more than one PAGE_SIZE (200) so the loop must fetch a
+        // second page, and far more than the 50-note default that used to cap it.
+        const TOTAL: usize = 250;
+        for _ in 0..TOTAL {
+            let mut note = make_test_note(
+                Uuid::new_v4(),
+                "The file `src/neo4j/client.rs` has a performance issue",
+                NoteType::Gotcha,
+                NoteImportance::High,
+                0.8,
+            );
+            note.project_id = Some(project_id);
+            store.create_note(&note).await.unwrap();
+        }
+
+        let report = auto_anchor_notes_for_project(&store, project_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.notes_processed, TOTAL,
+            "must scan every note, not just the first page"
+        );
+        assert_eq!(report.anchors_created, TOTAL);
+        assert_eq!(
+            report.root_path_resolved,
+            Some("/tmp/test-project".to_string())
+        );
     }
 }
