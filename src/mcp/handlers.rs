@@ -588,6 +588,7 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
     ("admin", "cleanup_builtin_calls", "cleanup_builtin_calls"),
     ("admin", "migrate_calls_confidence", "migrate_calls_confidence"),
     ("admin", "cleanup_sync_data", "cleanup_sync_data"),
+    ("admin", "purge_ignored_paths", "purge_ignored_paths"),
     ("admin", "update_staleness_scores", "update_staleness_scores"),
     ("admin", "update_energy_scores", "update_energy_scores"),
     ("admin", "search_neurons", "search_neurons"),
@@ -4707,6 +4708,30 @@ impl ToolHandler {
             "cleanup_sync_data" => {
                 let result = http
                     .post("/api/admin/cleanup-sync-data", &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "purge_ignored_paths" => {
+                // Required by the REST DTO. Checking here turns a raw 422 into the
+                // message the rest of this dispatch uses.
+                let project_id = args
+                    .get("project_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("project_id is required for purge_ignored_paths"))?;
+                let mut body = serde_json::Map::new();
+                body.insert(
+                    "project_id".to_string(),
+                    Value::String(project_id.to_string()),
+                );
+                // Default to a dry run — an apply must be requested explicitly.
+                let dry_run = args
+                    .get("dry_run")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                body.insert("dry_run".to_string(), Value::Bool(dry_run));
+                let result = http
+                    .post("/api/admin/purge-ignored-paths", &Value::Object(body))
                     .await?;
                 Ok(Some(result))
             }

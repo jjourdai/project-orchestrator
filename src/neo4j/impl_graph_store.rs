@@ -414,6 +414,14 @@ impl GraphStore for Neo4jClient {
         self.delete_stale_files(project_id, valid_paths).await
     }
 
+    async fn purge_ignored_paths(
+        &self,
+        project_id: Uuid,
+        dry_run: bool,
+    ) -> anyhow::Result<PurgeIgnoredResult> {
+        self.purge_ignored_paths(project_id, dry_run).await
+    }
+
     async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> anyhow::Result<()> {
         self.link_file_to_project(file_path, project_id).await
     }

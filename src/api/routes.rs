@@ -1615,6 +1615,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/admin/cleanup-sync-data",
             post(handlers::cleanup_sync_data),
         )
+        .route(
+            "/api/admin/purge-ignored-paths",
+            post(handlers::purge_ignored_paths),
+        )
         // ================================================================
         // Admin — Knowledge Fabric
         // ================================================================

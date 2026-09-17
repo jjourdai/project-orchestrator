@@ -2,7 +2,7 @@
 
 use super::client::Neo4jClient;
 use super::models::*;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use neo4rs::query;
 use uuid::Uuid;
 
@@ -157,6 +157,145 @@ impl Neo4jClient {
         );
 
         Ok((file_count, symbol_count, stale_paths))
+    }
+
+    /// Purge code nodes whose path the sync filter now rejects, scoped to ONE project.
+    ///
+    /// This exists alongside [`Self::cleanup_sync_data`] and is deliberately NOT that
+    /// function: `cleanup_sync_data` is label-wide across **all** projects and, as a
+    /// documented fallback, DETACH DELETEs nodes together with their Knowledge Fabric
+    /// edges. This one only ever touches `File` nodes reachable from the given
+    /// `Project`, and only those whose path `should_ignore_path` rejects — so notes,
+    /// decisions and personas attached to real source files cannot be collateral.
+    ///
+    /// The ignore filter is applied in Rust via [`crate::orchestrator::should_ignore_path`]
+    /// and never re-encoded in Cypher, so it cannot drift from the sync-time filter.
+    ///
+    /// Defaults to a dry run at every call site above this one — pass `dry_run: false`
+    /// only after reviewing the reported candidate list.
+    pub async fn purge_ignored_paths(
+        &self,
+        project_id: Uuid,
+        dry_run: bool,
+    ) -> Result<PurgeIgnoredResult> {
+        // ── Candidates ────────────────────────────────────────────────
+        let all_paths = self.get_project_file_paths(project_id).await?;
+        let files_scanned = all_paths.len();
+        let mut paths: Vec<String> = all_paths
+            .into_iter()
+            .filter(|p| crate::orchestrator::should_ignore_path(p))
+            .collect();
+        paths.sort();
+        paths.dedup();
+
+        let mut out = PurgeIgnoredResult {
+            dry_run,
+            files_scanned,
+            files_matched: paths.len(),
+            ..Default::default()
+        };
+
+        if paths.is_empty() {
+            return Ok(out);
+        }
+
+        // ── Audit: what would be removed ──────────────────────────────
+        // Symbols hang off File by CONTAINS, EXCEPT Import which uses HAS_IMPORT —
+        // matching only CONTAINS would leave orphaned Import nodes behind.
+        let audit_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE f.path IN $paths
+            OPTIONAL MATCH (f)-[:CONTAINS|HAS_IMPORT]->(symbol)
+            // Undirected on purpose: CO_CHANGED and CO_CHANGED_TRANSITIVE are stored
+            // with a direction that is not meaningful, so matching only incoming
+            // edges hides roughly half of them from the at-risk count — and that
+            // count is the safety gate this whole operation is built around.
+            OPTIONAL MATCH (f)-[kr]-()
+              WHERE type(kr) IN ['LINKED_TO', 'AFFECTS', 'DISCUSSED', 'TOUCHES', 'CO_CHANGED', 'CO_CHANGED_TRANSITIVE', 'KNOWS']
+            OPTIONAL MATCH (symbol)-[kr2]-()
+              WHERE type(kr2) IN ['LINKED_TO', 'AFFECTS', 'DISCUSSED', 'TOUCHES', 'CO_CHANGED', 'CO_CHANGED_TRANSITIVE', 'KNOWS']
+            RETURN count(DISTINCT symbol) AS symbol_count,
+                   count(DISTINCT kr) + count(DISTINCT kr2) AS knowledge_rels_count
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("paths", paths.clone());
+
+        // Do NOT swallow a failure here. knowledge_rels_at_risk is the documented
+        // safety gate: reporting 0 because the audit query errored looks exactly
+        // like "nothing is at risk", which is the one answer that would wrongly
+        // green-light an apply.
+        let mut audit_rows = self.graph.execute(audit_q).await.context(
+            "purge_ignored_paths: knowledge-relationship audit failed; refusing to \
+             report 0 at-risk relationships from a failed query",
+        )?;
+        let row = audit_rows
+            .next()
+            .await
+            .context("purge_ignored_paths: audit query returned no row")?
+            .context("purge_ignored_paths: audit query returned an empty result")?;
+        out.symbols_matched = row.get::<i64>("symbol_count").unwrap_or(0) as usize;
+        out.knowledge_rels_at_risk = row.get("knowledge_rels_count").unwrap_or(0);
+
+        if out.knowledge_rels_at_risk > 0 {
+            tracing::warn!(
+                "purge_ignored_paths: {} knowledge relationship(s) are attached to the {} \
+                 generated/vendored file(s) matched in project {}. Generated files are not \
+                 normally linked by hand — review the candidate list before applying.",
+                out.knowledge_rels_at_risk,
+                out.files_matched,
+                project_id
+            );
+        }
+
+        if dry_run {
+            out.paths = paths;
+            return Ok(out);
+        }
+
+        // ── Apply, batched to keep transactions bounded ───────────────
+        // NOTE the unit: this counts FILES, and a DETACH DELETE takes each file's
+        // symbols with it. At a few dozen symbols per file, 10k files would be
+        // several hundred thousand nodes in one transaction — enough to hit
+        // transaction-memory limits and leave the graph half-purged with the
+        // search-index cleanup skipped. 500 files is a few tens of thousands of
+        // nodes, which is comfortable.
+        let batch_size = 500;
+        for chunk in paths.chunks(batch_size) {
+            let delete_q = query(
+                r#"
+                MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+                WHERE f.path IN $paths
+                OPTIONAL MATCH (f)-[:CONTAINS|HAS_IMPORT]->(symbol)
+                DETACH DELETE symbol, f
+                "#,
+            )
+            .param("project_id", project_id.to_string())
+            .param("paths", chunk.to_vec());
+
+            self.graph.run(delete_q).await?;
+            tracing::info!(
+                "purge_ignored_paths: purged batch of {} file(s) for project {}",
+                chunk.len(),
+                project_id
+            );
+        }
+
+        out.files_deleted = out.files_matched;
+        out.symbols_deleted = out.symbols_matched;
+        out.paths = paths;
+
+        tracing::info!(
+            "purge_ignored_paths: removed {} generated/vendored file(s) and {} symbol(s) \
+             from project {} ({} file(s) scanned)",
+            out.files_deleted,
+            out.symbols_deleted,
+            project_id,
+            out.files_scanned
+        );
+
+        Ok(out)
     }
 
     /// Link a file to a project (create CONTAINS relationship)

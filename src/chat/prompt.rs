@@ -1669,7 +1669,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         tools: &[
             ToolRef {
                 name: "admin",
-                description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/delete_meilisearch_orphans/cleanup_cross_project_calls/cleanup_builtin_calls/migrate_calls_confidence/cleanup_sync_data/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/reindex_decisions/backfill_decision_embeddings/backfill_touches/backfill_discussed/update_fabric_scores/bootstrap_knowledge_fabric/reinforce_isomorphic/detect_skills/detect_skill_fission/detect_skill_fusion/maintain_skills/auto_anchor_notes/reconstruct_knowledge/heal_scars/consolidate_memory/detect_stagnation/deep_maintenance/audit_gaps/persist_health_report/install_hooks)",
+                description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/delete_meilisearch_orphans/cleanup_cross_project_calls/cleanup_builtin_calls/migrate_calls_confidence/cleanup_sync_data/purge_ignored_paths/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/reindex_decisions/backfill_decision_embeddings/backfill_touches/backfill_discussed/update_fabric_scores/bootstrap_knowledge_fabric/reinforce_isomorphic/detect_skills/detect_skill_fission/detect_skill_fusion/maintain_skills/auto_anchor_notes/reconstruct_knowledge/heal_scars/consolidate_memory/detect_stagnation/deep_maintenance/audit_gaps/persist_health_report/install_hooks)",
             },
             ToolRef {
                 name: "neural_routing",

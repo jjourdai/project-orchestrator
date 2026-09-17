@@ -204,6 +204,13 @@ impl SearchStore for MockSearchStore {
         Ok(())
     }
 
+    async fn delete_code_batch(&self, paths: &[String]) -> Result<()> {
+        let set: std::collections::HashSet<&str> = paths.iter().map(|p| p.as_str()).collect();
+        let mut docs = self.code_documents.write().await;
+        docs.retain(|d| !set.contains(d.path.as_str()));
+        Ok(())
+    }
+
     async fn delete_code_for_project(&self, project_slug: &str) -> Result<()> {
         let mut docs = self.code_documents.write().await;
         docs.retain(|d| d.project_slug != project_slug);

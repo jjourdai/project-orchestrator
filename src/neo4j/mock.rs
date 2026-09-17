@@ -1566,6 +1566,63 @@ impl GraphStore for MockGraphStore {
         Ok((files_deleted, symbols_deleted, deleted_paths))
     }
 
+    async fn purge_ignored_paths(
+        &self,
+        project_id: Uuid,
+        dry_run: bool,
+    ) -> Result<PurgeIgnoredResult> {
+        let current_paths = self
+            .project_files
+            .read()
+            .await
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default();
+        let files_scanned = current_paths.len();
+        let mut paths: Vec<String> = current_paths
+            .into_iter()
+            .filter(|p| crate::orchestrator::should_ignore_path(p))
+            .collect();
+        paths.sort();
+        paths.dedup();
+
+        let mut symbols_matched = 0usize;
+        {
+            let file_symbols = self.file_symbols.read().await;
+            for p in &paths {
+                symbols_matched += file_symbols.get(p).map(|s| s.len()).unwrap_or(0);
+            }
+        }
+
+        let mut out = PurgeIgnoredResult {
+            dry_run,
+            files_scanned,
+            files_matched: paths.len(),
+            symbols_matched,
+            ..Default::default()
+        };
+
+        if !dry_run {
+            // Cascade the same way delete_file does: dropping the file entry alone
+            // would leave the functions/structs/imports maps referencing paths that
+            // no longer exist, so a test could not tell a real purge from a no-op.
+            for path in &paths {
+                self.files.write().await.remove(path);
+                self.file_symbols.write().await.remove(path);
+                self.functions.write().await.retain(|_, f| f.file_path != *path);
+                self.structs_map.write().await.retain(|_, s| s.file_path != *path);
+                self.imports.write().await.retain(|_, i| i.file_path != *path);
+            }
+            if let Some(stored) = self.project_files.write().await.get_mut(&project_id) {
+                stored.retain(|p| !crate::orchestrator::should_ignore_path(p));
+            }
+            out.files_deleted = out.files_matched;
+            out.symbols_deleted = out.symbols_matched;
+        }
+        out.paths = paths;
+        Ok(out)
+    }
+
     async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()> {
         self.project_files
             .write()
@@ -16240,5 +16297,42 @@ mod tests {
             .collect();
         statuses.sort();
         assert_eq!(statuses, vec!["completed", "failed", "in_progress"]);
+    }
+
+    /// The purge must be scoped AND must cascade. Nothing exercised the mock
+    /// before, which is how it shipped dropping the file entry while leaving the
+    /// symbol maps pointing at paths that no longer existed.
+    #[tokio::test]
+    async fn test_purge_ignored_paths_is_scoped_and_cascades() {
+        let store = MockGraphStore::new();
+        let project = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        let generated = "/repo/frontend/.svelte-kit/output/chunk.js".to_string();
+        let real = "/repo/frontend/src/lib/api.ts".to_string();
+        let elsewhere = "/other/frontend/.svelte-kit/output/x.js".to_string();
+
+        for (pid, path) in [(project, &generated), (project, &real), (other, &elsewhere)] {
+            GraphStore::link_file_to_project(&store, path, pid).await.unwrap();
+        }
+
+        // Dry run reports without touching anything.
+        let preview = GraphStore::purge_ignored_paths(&store, project, true)
+            .await
+            .unwrap();
+        assert_eq!(preview.files_matched, 1, "only the generated file matches");
+        assert_eq!(preview.files_deleted, 0, "a dry run deletes nothing");
+        assert_eq!(preview.paths, vec![generated.clone()]);
+
+        let applied = GraphStore::purge_ignored_paths(&store, project, false)
+            .await
+            .unwrap();
+        assert_eq!(applied.files_deleted, 1);
+
+        // The real source file is untouched, and so is the OTHER project's
+        // generated file — scoping is the whole point of this operation.
+        let remaining = store.project_files.read().await;
+        assert_eq!(remaining.get(&project).unwrap(), &vec![real.clone()]);
+        assert_eq!(remaining.get(&other).unwrap(), &vec![elsewhere.clone()]);
     }
 }

@@ -60,6 +60,10 @@ impl SearchStore for MeiliClient {
         self.delete_code(path).await
     }
 
+    async fn delete_code_batch(&self, paths: &[String]) -> Result<()> {
+        self.delete_code_batch(paths).await
+    }
+
     async fn delete_code_for_project(&self, project_slug: &str) -> Result<()> {
         self.delete_code_for_project(project_slug).await
     }

@@ -2614,6 +2614,80 @@ pub async fn cleanup_sync_data(
     })))
 }
 
+/// Request body for purge-ignored-paths
+#[derive(Deserialize)]
+pub struct PurgeIgnoredRequest {
+    pub project_id: Uuid,
+    /// Absent means TRUE — an actual deletion has to be asked for explicitly.
+    pub dry_run: Option<bool>,
+}
+
+/// POST /api/admin/purge-ignored-paths — path-scoped purge of generated/vendored code nodes
+///
+/// Deletes only File nodes (and their symbols) reachable from THIS project whose path
+/// `should_ignore_path` rejects. Contrast with `cleanup_sync_data`, which is label-wide
+/// across every project. Dry run unless `dry_run: false` is passed.
+pub async fn purge_ignored_paths(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<PurgeIgnoredRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let dry_run = body.dry_run.unwrap_or(true);
+    let result = state
+        .orchestrator
+        .neo4j()
+        .purge_ignored_paths(body.project_id, dry_run)
+        .await?;
+
+    // On apply, drop the same paths from the search index, otherwise code(search)
+    // keeps returning generated chunks that no longer exist in the graph. ONE
+    // batched task, not a per-path loop: delete_code waits for completion per
+    // document, so a few hundred paths would exceed the request timeout and the
+    // caller would get a 408 with the graph already committed and the index only
+    // half-cleaned.
+    let mut meili_error: Option<String> = None;
+    if !dry_run {
+        if let Err(e) = state
+            .orchestrator
+            .meili()
+            .delete_code_batch(&result.paths)
+            .await
+        {
+            tracing::warn!("purge_ignored_paths: Meilisearch cleanup failed: {}", e);
+            meili_error = Some(e.to_string());
+        }
+    }
+
+    // The path list is the point of a dry run, but it is also unbounded — the
+    // motivating case matched 459 files, and returning all of them verbatim is
+    // tens of KB straight into an agent's context. Return a readable sample and
+    // say how many were withheld; the counts above are the decision-grade data.
+    const MAX_PATHS: usize = 50;
+    let truncated = result.paths.len().saturating_sub(MAX_PATHS);
+    let sample: Vec<&String> = result.paths.iter().take(MAX_PATHS).collect();
+
+    let mut body = serde_json::json!({
+        "dry_run": result.dry_run,
+        "files_scanned": result.files_scanned,
+        "files_matched": result.files_matched,
+        "symbols_matched": result.symbols_matched,
+        "knowledge_rels_at_risk": result.knowledge_rels_at_risk,
+        "files_deleted": result.files_deleted,
+        "symbols_deleted": result.symbols_deleted,
+        "paths": sample,
+        "paths_truncated": truncated,
+    });
+    if let Some(err) = meili_error {
+        body["meilisearch_error"] = serde_json::Value::String(err);
+        body["warning"] = serde_json::Value::String(
+            "Graph nodes were deleted but the search index was NOT cleaned. \
+             Re-run admin(delete_meilisearch_orphans) to finish."
+                .to_string(),
+        );
+    }
+
+    Ok(Json(body))
+}
+
 // ============================================================================
 // Commits
 // ============================================================================
