@@ -51,6 +51,10 @@ pub trait SearchStore: Send + Sync {
     /// Delete code document by path
     async fn delete_code(&self, path: &str) -> Result<()>;
 
+    /// Delete many code documents in ONE task. Prefer this over looping
+    /// `delete_code`, which waits for completion per document.
+    async fn delete_code_batch(&self, paths: &[String]) -> Result<()>;
+
     /// Delete all code documents for a project
     async fn delete_code_for_project(&self, project_slug: &str) -> Result<()>;
 

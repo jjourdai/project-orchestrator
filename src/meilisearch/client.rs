@@ -249,6 +249,26 @@ impl MeiliClient {
         Ok(())
     }
 
+    /// Delete many code documents in ONE task.
+    ///
+    /// [`Self::delete_code`] waits for task completion per document (up to 30s
+    /// each), which is fine for a single stale file but not for a purge: at a few
+    /// tens of milliseconds per round trip, a few hundred paths already exceed the
+    /// API's 60s request timeout, and the caller gets a 408 after the graph delete
+    /// has committed — leaving orphan documents nothing can re-derive. One task,
+    /// one wait.
+    pub async fn delete_code_batch(&self, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let index = self.client.index(index_names::CODE);
+        let ids: Vec<String> = paths.iter().map(|p| Self::path_to_id(p)).collect();
+        let task = index.delete_documents(&ids).await?;
+        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(120)))
+            .await?;
+        Ok(())
+    }
+
     /// Delete all code documents for a project
     pub async fn delete_code_for_project(&self, project_slug: &str) -> Result<()> {
         use meilisearch_sdk::documents::DocumentDeletionQuery;
