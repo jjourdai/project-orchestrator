@@ -441,7 +441,8 @@ Administrative operations: sync, watch, Knowledge Fabric, maintenance.
 | `cleanup_cross_project_calls` | Remove cross-project CALLS | — |
 | `cleanup_builtin_calls` | Remove builtin function calls | — |
 | `migrate_calls_confidence` | Migrate confidence scores | — |
-| `cleanup_sync_data` | Clean stale sync data | — |
+| `cleanup_sync_data` | Clean stale sync data — **label-wide across ALL projects**, destroys Knowledge Fabric edges | — |
+| `purge_ignored_paths` | Delete generated/vendored code nodes for ONE project. Prefer this over `cleanup_sync_data`. | `project_id` (required), `dry_run` (default `true`) |
 
 ### Knowledge Fabric
 

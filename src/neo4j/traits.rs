@@ -330,6 +330,15 @@ pub trait GraphStore: Send + Sync {
         valid_paths: &[String],
     ) -> Result<(usize, usize, Vec<String>)>;
 
+    /// Purge code nodes whose path the sync filter rejects, scoped to ONE project.
+    /// Unlike `cleanup_sync_data` this never touches other projects and never
+    /// destroys Knowledge Fabric edges on real source files.
+    async fn purge_ignored_paths(
+        &self,
+        project_id: Uuid,
+        dry_run: bool,
+    ) -> Result<PurgeIgnoredResult>;
+
     /// Link a file to a project (create CONTAINS relationship)
     async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()>;
 

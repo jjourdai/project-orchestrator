@@ -56,6 +56,19 @@ pub const IGNORED_PATH_SEGMENTS: &[&str] = &[
     "/.pytest_cache/",
     "/.ruff_cache/",
     "/__pycache__/",
+    // Generated web bundles & vendored IaC modules
+    "/.svelte-kit/",
+    "/.terraform/",
+    "/.turbo/",
+    "/.parcel-cache/",
+    "/.astro/",
+    "/.output/",
+    // Capacitor copies the built web bundle into the native projects —
+    // the SAME files then get indexed a second and third time.
+    // Scoped tightly so real native source (android/app/src/main/java, ios/App/App/*.swift)
+    // keeps being indexed.
+    "/android/app/src/main/assets/public/",
+    "/ios/App/App/public/",
 ];
 
 /// Check whether a file path should be ignored during sync.
@@ -177,6 +190,45 @@ mod tests {
         // But legitimate source files should NOT be caught
         assert!(!should_ignore_path("/project/src/venvironment.py"));
         assert!(!should_ignore_path("/project/src/event.py"));
+    }
+
+    #[test]
+    fn test_should_ignore_generated_bundles_and_vendored_iac() {
+        // SvelteKit generated output
+        assert!(should_ignore_path(
+            "/repo/frontend/.svelte-kit/output/server/entries/pages/publish/_page.ts.js"
+        ));
+        // Vendored Terraform modules (terraform init pulls these in)
+        assert!(should_ignore_path(
+            "/repo/infra/terraform/.terraform/modules/lambda/iam.tf"
+        ));
+        // Capacitor copies the built web bundle into BOTH native projects,
+        // which is how one bundle got indexed three times over.
+        assert!(should_ignore_path(
+            "/repo/frontend/android/app/src/main/assets/public/_app/immutable/chunks/BTLF1Zap2.js"
+        ));
+        assert!(should_ignore_path("/repo/frontend/ios/App/App/public/index.html"));
+        // Other generated/cache dirs in the same class
+        assert!(should_ignore_path("/repo/.turbo/daemon/foo.log"));
+        assert!(should_ignore_path("/repo/.parcel-cache/foo.txt"));
+        assert!(should_ignore_path("/repo/.astro/types.d.ts"));
+        assert!(should_ignore_path("/repo/.output/server/index.mjs"));
+
+        // ── Negative assertions: real source must STILL be indexed ──
+        // A source file merely named after terraform
+        assert!(!should_ignore_path("/repo/src/terraform_parser.rs"));
+        // "kit" as a real source directory must not be caught by "/.svelte-kit/"
+        assert!(!should_ignore_path("/repo/src/kit/foo.ts"));
+        // The real route that the generated _page.ts.js above was built FROM
+        assert!(!should_ignore_path("/repo/frontend/src/routes/publish/+page.ts"));
+        // Real native source must keep being indexed — the Capacitor entries are
+        // deliberately scoped to the copied web-asset dirs, not to android/ or ios/
+        assert!(!should_ignore_path(
+            "/repo/frontend/android/app/src/main/java/com/wayuto/MainActivity.java"
+        ));
+        assert!(!should_ignore_path("/repo/frontend/ios/App/App/AppDelegate.swift"));
+        // A legitimate directory named "output" (no leading dot)
+        assert!(!should_ignore_path("/repo/src/output/formatter.rs"));
     }
 
     #[test]

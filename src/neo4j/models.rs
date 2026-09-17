@@ -2383,6 +2383,35 @@ pub struct McpToolNode {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+// ============================================================================
+// Path-scoped purge of generated/vendored code nodes
+// ============================================================================
+
+/// Outcome of [`Neo4jClient::purge_ignored_paths`].
+///
+/// `files_deleted` / `symbols_deleted` stay at 0 on a dry run — inspect
+/// `files_matched` / `symbols_matched` to see what an apply would remove.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PurgeIgnoredResult {
+    /// True when nothing was actually deleted.
+    pub dry_run: bool,
+    /// Total File nodes the project has, before filtering.
+    pub files_scanned: usize,
+    /// File nodes whose path the sync filter now rejects.
+    pub files_matched: usize,
+    /// Symbols (Function/Struct/Trait/Enum/Impl/Import) owned by those files.
+    pub symbols_matched: usize,
+    /// Knowledge Fabric edges (LINKED_TO/AFFECTS/DISCUSSED/TOUCHES/CO_CHANGED)
+    /// attached to the matched nodes. Expected to be 0 for generated files —
+    /// a non-zero value means a human linked knowledge to a generated path and
+    /// the candidate list deserves a second look before applying.
+    pub knowledge_rels_at_risk: i64,
+    pub files_deleted: usize,
+    pub symbols_deleted: usize,
+    /// The matched paths, sorted. Also used by the caller to clean Meilisearch.
+    pub paths: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
