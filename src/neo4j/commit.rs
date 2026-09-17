@@ -420,7 +420,7 @@ impl Neo4jClient {
         // Only creates relations where no direct CO_CHANGED exists.
         let bfs_q = query(
             r#"
-            MATCH (f1:File {project_id: $project_id})-[path:CO_CHANGED*2..2]-(f2:File)
+            MATCH path = (f1:File {project_id: $project_id})-[:CO_CHANGED*2..2]-(f2:File)
             WHERE f1 <> f2
               AND f1.path < f2.path
               AND NOT EXISTS { MATCH (f1)-[:CO_CHANGED]-(f2) }
@@ -454,7 +454,7 @@ impl Neo4jClient {
         if max_depth >= 3 {
             let bfs3_q = query(
                 r#"
-                MATCH (f1:File {project_id: $project_id})-[path:CO_CHANGED*3..3]-(f2:File)
+                MATCH path = (f1:File {project_id: $project_id})-[:CO_CHANGED*3..3]-(f2:File)
                 WHERE f1 <> f2
                   AND f1.path < f2.path
                   AND NOT EXISTS { MATCH (f1)-[:CO_CHANGED]-(f2) }

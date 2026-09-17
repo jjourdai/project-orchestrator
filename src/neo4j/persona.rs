@@ -517,7 +517,7 @@ impl Neo4jClient {
             r#"
             MATCH (p:Persona {id: $persona_id}), (f:File)
             WHERE f.path ENDS WITH $file_path AND f.path ENDS WITH ('/' + $file_path)
-            WITH p, f ORDER BY length(f.path) LIMIT 1
+            WITH p, f ORDER BY size(f.path) LIMIT 1
             MERGE (p)-[r:KNOWS]->(f)
             SET r.weight = $weight
             "#
@@ -1790,9 +1790,12 @@ impl Neo4jClient {
                  [nb IN notes_b | nb.id] AS note_ids_b
             OPTIONAL MATCH (s1:Note)-[syn:SYNAPSE]->(s2:Note)
             WHERE s1.id IN note_ids_a AND s2.id IN note_ids_b
+            // Aggregate first: note_ids_a/b are grouping keys, so combining
+            // them with count() in one projection is rejected (42I18).
+            WITH jaccard, note_ids_a, note_ids_b, count(syn) AS syn_count
             WITH jaccard,
                  CASE WHEN size(note_ids_a) > 0 AND size(note_ids_b) > 0
-                      THEN toFloat(count(syn)) / toFloat(size(note_ids_a) * size(note_ids_b))
+                      THEN toFloat(syn_count) / toFloat(size(note_ids_a) * size(note_ids_b))
                       ELSE 0.0
                  END AS synapse_density
             RETURN jaccard, synapse_density

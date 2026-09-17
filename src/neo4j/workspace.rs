@@ -1645,7 +1645,8 @@ impl Neo4jClient {
                         WITH count(sa) AS a_from_b
                         OPTIONAL MATCH (sb:Skill {project_id: $pb_id})
                         WHERE sb.imported_from_project = $pa_id
-                        RETURN a_from_b + count(sb) AS total_imports
+                        WITH a_from_b, count(sb) AS b_from_a
+                        RETURN a_from_b + b_from_a AS total_imports
                         "#,
                     )
                     .param("pa_id", pa.id.to_string())
