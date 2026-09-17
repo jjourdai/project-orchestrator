@@ -2491,8 +2491,25 @@ impl Neo4jClient {
         Ok(total_updated)
     }
 
-    /// Get all functions called by a function
+    /// Get all functions called by a function, transitively, up to `depth` hops.
+    ///
+    /// `depth` is clamped to 1..=5 here rather than at the call site. It is
+    /// interpolated directly into a variable-length pattern, and it arrives
+    /// from a request body (`POST /api/personas/auto-build` →
+    /// `persona_handlers::auto_build_persona`, which defaults it to 3 but
+    /// applied no upper bound), so an unclamped value let a caller ask for
+    /// `*1..1000000`. The traversal enumerates trails internally even though
+    /// `DISTINCT callee` bounds the result to the Function count, so cost grows
+    /// with depth (mean CALLS out-degree is ~7) until it exhausts the request
+    /// timeout or Neo4j's transaction memory. Clamping at this chokepoint keeps
+    /// any future caller safe too; 5 matches the bound used by
+    /// `auto_build_feature_graph`.
+    ///
+    /// Known limitation: this is not project-scoped, so results can cross
+    /// project boundaries where CALLS edges do (see
+    /// `cleanup_cross_project_calls`).
     pub async fn get_callees(&self, function_id: &str, depth: u32) -> Result<Vec<FunctionNode>> {
+        let depth = depth.clamp(1, 5);
         let q = query(&format!(
             r#"
             MATCH (f:Function {{id: $id}})-[:CALLS*1..{}]->(callee:Function)
@@ -4203,7 +4220,11 @@ impl Neo4jClient {
             WITH f, p, count(DISTINCT n) AS note_count
             OPTIONAL MATCH (d:Decision)-[:AFFECTS]->(f)
             WHERE d.status IN ['proposed', 'accepted']
-            WITH f, p, note_count + count(DISTINCT d) AS target_count
+            // `note_count` must stay a grouping key and be added in a later
+            // WITH; summing it alongside count() in one projection makes it an
+            // implicitly grouped expression, which Neo4j 5 rejects (42I18).
+            WITH f, p, note_count, count(DISTINCT d) AS decision_count
+            WITH f, p, note_count + decision_count AS target_count
 
             // Find max knowledge count across all files in the project
             OPTIONAL MATCH (p)-[:CONTAINS]->(af:File)
@@ -4212,7 +4233,8 @@ impl Neo4jClient {
             WITH f, target_count, af, count(DISTINCT an) AS af_note_count
             OPTIONAL MATCH (ad:Decision)-[:AFFECTS]->(af)
             WHERE ad.status IN ['proposed', 'accepted']
-            WITH target_count, af_note_count + count(DISTINCT ad) AS af_total
+            WITH target_count, af_note_count, count(DISTINCT ad) AS af_decision_count
+            WITH target_count, af_note_count + af_decision_count AS af_total
             WITH target_count, max(af_total) AS max_count
 
             RETURN target_count,
