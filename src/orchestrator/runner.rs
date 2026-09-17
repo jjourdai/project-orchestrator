@@ -3000,7 +3000,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         parsed_path,
                         &ctx.suffix_index,
                     ),
-                    "typescript" | "javascript" | "tsx" | "jsx" => {
+                    // `svelte` routes here too: a component's imports ARE TypeScript
+                    // imports, and the resolver understands `.svelte` targets and the
+                    // `$lib` alias.
+                    "typescript" | "javascript" | "tsx" | "jsx" | "svelte" => {
                         Self::resolve_typescript_import_indexed(
                             &import.path,
                             parsed_path,
@@ -3095,6 +3098,12 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 // Legacy fallback: filesystem-based resolution
                 match language {
                     "rust" => self.resolve_rust_imports(&import.path, parsed_path),
+                    // NOT "svelte" here, deliberately. This legacy filesystem
+                    // fallback runs only when there is no SuffixIndex, and
+                    // resolve_typescript_import cannot serve Svelte: it rejects
+                    // `$lib` at its guard and rewrites `./Card.svelte` to
+                    // `./Card.ts` via with_extension. Listing svelte would read as
+                    // support while resolving nothing.
                     "typescript" | "javascript" | "tsx" | "jsx" => self
                         .resolve_typescript_import(&import.path, parsed_path)
                         .into_iter()
@@ -3229,63 +3238,94 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
     }
 
-    /// Resolve TypeScript/JavaScript import using SuffixIndex.
+    /// Probe the file index for a module target.
+    ///
+    /// Order matters. The BARE path is tried first, because a Svelte import carries
+    /// its extension — `import Card from './Card.svelte'` — and appending `.ts` to
+    /// that can never match. Trying it first is safe for TypeScript too: the index
+    /// only ever contains files whose extension the parser recognises, so a bare
+    /// probe cannot accidentally match an extensionless file. An extensionless TS
+    /// import simply misses and falls through to the extension list as before.
+    fn probe_module_target(
+        target: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Option<String> {
+        if let Some(resolved) = index.get(target) {
+            return Some(resolved.to_string());
+        }
+
+        for ext in ["ts", "tsx", "js", "jsx", "svelte"] {
+            if let Some(resolved) = index.get(&format!("{target}.{ext}")) {
+                return Some(resolved.to_string());
+            }
+        }
+
+        for idx in ["index.ts", "index.tsx", "index.js", "index.jsx"] {
+            if let Some(resolved) = index.get(&format!("{target}/{idx}")) {
+                return Some(resolved.to_string());
+            }
+        }
+
+        None
+    }
+
+    /// Resolve a TypeScript/JavaScript/Svelte import using SuffixIndex.
+    ///
+    /// Handles relative imports, the `@/` alias, and SvelteKit's `$lib` alias.
+    /// `$app/*` is deliberately NOT resolved: it is a framework-internal namespace
+    /// with no file on disk, so there is nothing to point an IMPORTS edge at.
     fn resolve_typescript_import_indexed(
         import_path: &str,
         source_file: &str,
         index: &crate::resolver::SuffixIndex,
     ) -> Option<String> {
-        // Only resolve relative imports and @/ aliases
-        if !import_path.starts_with('.') && !import_path.starts_with('@') {
-            return None; // npm package — skip
+        // Relative imports, `@/` aliases and `$` aliases only — anything else is an
+        // npm package.
+        if !import_path.starts_with('.')
+            && !import_path.starts_with('@')
+            && !import_path.starts_with('$')
+        {
+            return None;
         }
 
         if import_path.starts_with('.') {
-            // Relative import: resolve against source directory
             let source_dir = source_file
                 .rsplit_once('/')
                 .map(|(dir, _)| dir)
                 .unwrap_or("");
             let target = resolve_relative_path(source_dir, import_path);
-
-            // Try extensions
-            let extensions = ["ts", "tsx", "js", "jsx"];
-            for ext in &extensions {
-                let with_ext = format!("{}.{}", target, ext);
-                if let Some(resolved) = index.get(&with_ext) {
-                    return Some(resolved.to_string());
-                }
-            }
-
-            // Try index files
-            let index_files = ["index.ts", "index.tsx", "index.js", "index.jsx"];
-            for idx in &index_files {
-                let index_path = format!("{}/{}", target, idx);
-                if let Some(resolved) = index.get(&index_path) {
-                    return Some(resolved.to_string());
-                }
-            }
-        } else if let Some(after_alias) = import_path.strip_prefix("@/") {
-            // @/ alias — try src/ prefix
-            let target = format!("src/{}", after_alias);
-
-            let extensions = ["ts", "tsx", "js", "jsx"];
-            for ext in &extensions {
-                let with_ext = format!("{}.{}", target, ext);
-                if let Some(resolved) = index.get(&with_ext) {
-                    return Some(resolved.to_string());
-                }
-            }
-
-            let index_files = ["index.ts", "index.tsx", "index.js", "index.jsx"];
-            for idx in &index_files {
-                let index_path = format!("{}/{}", target, idx);
-                if let Some(resolved) = index.get(&index_path) {
-                    return Some(resolved.to_string());
-                }
-            }
+            return Self::probe_module_target(&target, index);
         }
 
+        if let Some(after_alias) = import_path.strip_prefix("@/") {
+            return Self::probe_module_target(&format!("src/{after_alias}"), index);
+        }
+
+        // SvelteKit maps `$lib` to `src/lib` by convention — but to the `src/lib`
+        // of the app the importing file belongs to, not to any `src/lib` in the
+        // repo. Probing the bare suffix `src/lib/...` is wrong in a monorepo: an
+        // import from apps/admin resolves into apps/web, or goes ambiguous when
+        // both apps define the module. Anchor it to the importer's own app root.
+        if let Some(after_alias) = import_path
+            .strip_prefix("$lib/")
+            .or_else(|| (import_path == "$lib").then_some(""))
+        {
+            let lib_root = match source_file.rfind("/src/") {
+                Some(i) => format!("{}/src/lib", &source_file[..i]),
+                // No app root in the path (a bare `src/...` file, or a test
+                // fixture): fall back to the suffix and let the index decide.
+                None => "src/lib".to_string(),
+            };
+            let target = if after_alias.is_empty() {
+                lib_root
+            } else {
+                format!("{lib_root}/{after_alias}")
+            };
+            return Self::probe_module_target(&target, index);
+        }
+
+        // `$app/...`, `$env/...` and friends are framework-internal: no file exists,
+        // so there is nothing to resolve to.
         None
     }
 
@@ -7631,6 +7671,132 @@ mod tests {
         let result =
             Orchestrator::resolve_typescript_import_indexed("react", "src/main.ts", &index);
         assert_eq!(result, None);
+    }
+
+    /// A Svelte import carries its extension, so appending `.ts` to it can never
+    /// match. Before the bare-path probe, EVERY `./X.svelte` import silently
+    /// resolved to nothing and the component was left a graph island.
+    #[test]
+    fn test_resolve_typescript_import_indexed_svelte_relative() {
+        let paths = vec![
+            "src/lib/components/Card.svelte".to_string(),
+            "src/routes/+page.svelte".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_typescript_import_indexed(
+            "../lib/components/Card.svelte",
+            "src/routes/+page.svelte",
+            &index,
+        );
+        assert_eq!(result, Some("src/lib/components/Card.svelte".to_string()));
+    }
+
+    /// `$lib` is SvelteKit's alias for `src/lib` and the dominant import style in a
+    /// real app. The old guard admitted only `.` and `@`, so every one of these was
+    /// dropped before it was ever looked up.
+    #[test]
+    fn test_resolve_typescript_import_indexed_sveltekit_lib_alias() {
+        let paths = vec![
+            "src/lib/api.ts".to_string(),
+            "src/lib/components/Card.svelte".to_string(),
+            "src/lib/index.ts".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Extensionless module through the alias
+        assert_eq!(
+            Orchestrator::resolve_typescript_import_indexed("$lib/api", "src/routes/+page.ts", &index),
+            Some("src/lib/api.ts".to_string())
+        );
+        // Component through the alias, extension included
+        assert_eq!(
+            Orchestrator::resolve_typescript_import_indexed(
+                "$lib/components/Card.svelte",
+                "src/routes/+page.svelte",
+                &index
+            ),
+            Some("src/lib/components/Card.svelte".to_string())
+        );
+        // Bare `$lib` falls back to the index file
+        assert_eq!(
+            Orchestrator::resolve_typescript_import_indexed("$lib", "src/routes/+page.ts", &index),
+            Some("src/lib/index.ts".to_string())
+        );
+    }
+
+    /// In a monorepo, `$lib` must resolve within the importing file's OWN app.
+    /// Probing the bare `src/lib/...` suffix sends an import from apps/admin into
+    /// apps/web, or makes it ambiguous when both apps define the module — and
+    /// `$lib` is the dominant import style, so nearly every edge would be wrong.
+    #[test]
+    fn test_resolve_typescript_import_indexed_lib_alias_is_app_scoped() {
+        let paths = vec![
+            "apps/web/src/lib/api.ts".to_string(),
+            "apps/admin/src/lib/api.ts".to_string(),
+            "apps/admin/src/routes/+page.ts".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        assert_eq!(
+            Orchestrator::resolve_typescript_import_indexed(
+                "$lib/api",
+                "apps/admin/src/routes/+page.ts",
+                &index
+            ),
+            Some("apps/admin/src/lib/api.ts".to_string()),
+            "must resolve inside the importer's own app, not the other one"
+        );
+        assert_eq!(
+            Orchestrator::resolve_typescript_import_indexed(
+                "$lib/api",
+                "apps/web/src/routes/+page.ts",
+                &index
+            ),
+            Some("apps/web/src/lib/api.ts".to_string())
+        );
+    }
+
+    /// `$app/*` and `$env/*` are framework-internal namespaces with no file on disk.
+    /// Relaxing the guard to admit `$` must not make them resolve to something.
+    #[test]
+    fn test_resolve_typescript_import_indexed_sveltekit_internal_namespaces_are_not_resolved() {
+        let paths = vec!["src/lib/api.ts".to_string(), "src/app.ts".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        for internal in ["$app/navigation", "$app/stores", "$env/static/public"] {
+            assert_eq!(
+                Orchestrator::resolve_typescript_import_indexed(internal, "src/routes/+page.ts", &index),
+                None,
+                "{internal} must not resolve — it has no file on disk"
+            );
+        }
+    }
+
+    /// Non-regression: trying the bare path first must not change how ordinary
+    /// extensionless TypeScript imports resolve. The index only holds files with a
+    /// recognised extension, so a bare probe cannot match an extensionless file.
+    #[test]
+    fn test_resolve_typescript_import_indexed_bare_probe_does_not_shadow_extensions() {
+        let paths = vec![
+            "src/lib/utils.ts".to_string(),
+            "src/lib/widget.tsx".to_string(),
+            "src/lib/legacy.js".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        assert_eq!(
+            Orchestrator::resolve_typescript_import_indexed("./utils", "src/lib/main.ts", &index),
+            Some("src/lib/utils.ts".to_string())
+        );
+        assert_eq!(
+            Orchestrator::resolve_typescript_import_indexed("./widget", "src/lib/main.ts", &index),
+            Some("src/lib/widget.tsx".to_string())
+        );
+        assert_eq!(
+            Orchestrator::resolve_typescript_import_indexed("./legacy", "src/lib/main.ts", &index),
+            Some("src/lib/legacy.js".to_string())
+        );
     }
 
     #[test]
