@@ -69,6 +69,18 @@ pub const IGNORED_PATH_SEGMENTS: &[&str] = &[
     // keeps being indexed.
     "/android/app/src/main/assets/public/",
     "/ios/App/App/public/",
+    // Build output for languages the watcher only started seeing once its
+    // extension list was derived from the parser rather than hand-maintained.
+    // Without these, a `dotnet build` pushes thousands of generated obj/**/*.cs
+    // events past should_sync_file, resets the debounce repeatedly, and past
+    // BULK_SYNC_THRESHOLD escalates to a full-project re-sync on every build.
+    // (/.terraform/ belongs to this group too, and is listed above.)
+    //
+    // NOT "/bin/": Rust puts real source in src/bin/ (gonnado's ingest-worker
+    // alone has 48 binaries there). C# build output is caught by "/obj/" on its
+    // own, so the risk is not worth the coverage.
+    "/obj/",
+    "/.dart_tool/",
 ];
 
 /// Check whether a file path should be ignored during sync.

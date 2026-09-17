@@ -231,7 +231,7 @@ src/
 ├── parser/
 │   ├── mod.rs           # CodeParser, SupportedLanguage, dispatch
 │   ├── helpers.rs       # Shared utility functions
-│   └── languages/       # Per-language extractors (16 languages)
+│   └── languages/       # Per-language extractors (17 languages)
 ├── plan/
 │   ├── manager.rs       # Plan/Task CRUD operations
 │   └── models.rs        # Plan/Task/Decision types
@@ -532,23 +532,27 @@ event: error             → {"message": "..."}
 2. **Error handling**: Use `anyhow::Result` and `AppError` for HTTP errors
 3. **State**: `ServerState` contains `orchestrator`, `watcher`, and `chat_manager`
 4. **Tests**: All API tests require the server running on port 8080
-5. **File extensions**: Parser supports 16 languages:
+5. **File extensions**: 17 languages. `SupportedLanguage::from_extension`
+   (`src/parser/mod.rs`) is the SOURCE OF TRUTH — both the full scan (`scan_files`) and the
+   file watcher (`should_sync_file`) derive from it, so this list is documentation only and
+   must never be re-implemented anywhere:
    - Rust: `.rs`
-   - TypeScript/JavaScript: `.ts`, `.tsx`, `.js`, `.jsx`
-   - Python: `.py`
+   - TypeScript/JavaScript: `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`
+   - Python: `.py`, `.pyi`
    - Go: `.go`
    - Java: `.java`
    - C: `.c`, `.h`
-   - C++: `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`
-   - Ruby: `.rb`
-   - PHP: `.php`
+   - C++: `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.hh`
+   - Ruby: `.rb`, `.rake`, `.gemspec`
+   - PHP: `.php`, `.phtml`, `.php5`, `.php7`
    - Kotlin: `.kt`, `.kts`
    - Swift: `.swift`
-   - Bash: `.sh`, `.bash`
+   - Bash: `.sh`, `.bash`, `.zsh`
    - C#: `.cs`
-   - Scala: `.scala`
+   - Scala: `.scala`, `.sc`
    - Zig: `.zig`
    - HCL/Terraform: `.tf`, `.tfvars`
+   - Dart: `.dart`
 
 ## Testing
 

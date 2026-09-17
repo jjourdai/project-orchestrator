@@ -110,7 +110,7 @@ src/
 ├── mcp/           # MCP server and tool definitions (22 mega-tools)
 ├── neo4j/         # Neo4j client, models, GraphStore trait + mock
 ├── meilisearch/   # Search client, SearchStore trait + mock
-├── parser/        # Tree-sitter code parsing (16 languages)
+├── parser/        # Tree-sitter code parsing (17 languages)
 ├── plan/          # Plan and task management
 ├── notes/         # Knowledge notes system
 ├── orchestrator/  # Core orchestration logic

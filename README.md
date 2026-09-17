@@ -681,7 +681,7 @@ chat:
 ┌──────────┐  ┌──────────┐     ┌──────────┐     ┌──────────────┐
 │  NEO4J   │  │MEILISEARCH│    │  NATS    │     │ TREE-SITTER  │
 │          │  │          │     │          │     │              │
-│• Code    │  │• Code    │     │• Event   │     │• 16 languages│
+│• Code    │  │• Code    │     │• Event   │     │• 17 languages│
 │  graph   │  │  search  │     │  sync    │     │• AST parsing │
 │• Plans   │  │• Decisions│    │• Chat    │     │• Symbols     │
 │• Decisions│ │          │     │  relay   │     │              │
