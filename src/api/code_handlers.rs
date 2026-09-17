@@ -436,7 +436,12 @@ pub async fn get_call_graph(
     State(state): State<OrchestratorState>,
     Query(query): Query<CallGraphQuery>,
 ) -> Result<Json<CallGraphNode>, AppError> {
-    let depth = query.depth.unwrap_or(2).clamp(1, 20);
+    // Measured on get_function_callers_by_name (name='get', which matches many
+    // functions): depth 20 costs 1,499,918 db-hits / 439 ms versus 130,269 /
+    // 75 ms at depth 5 — and `direction=both` runs two such queries per
+    // request. 20 bought nothing: the reachable caller set saturates within a
+    // few hops, so the extra depth only re-walked trails.
+    let depth = query.depth.unwrap_or(2).clamp(1, 5);
     let direction = query.direction.as_deref().unwrap_or("both");
 
     let project_id = if let Some(ref slug) = query.project_slug {

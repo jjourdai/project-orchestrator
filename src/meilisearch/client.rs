@@ -264,8 +264,12 @@ impl MeiliClient {
         let index = self.client.index(index_names::CODE);
         let ids: Vec<String> = paths.iter().map(|p| Self::path_to_id(p)).collect();
         let task = index.delete_documents(&ids).await?;
-        task.wait_for_completion(&self.client, None, Some(std::time::Duration::from_secs(120)))
-            .await?;
+        task.wait_for_completion(
+            &self.client,
+            None,
+            Some(std::time::Duration::from_secs(120)),
+        )
+        .await?;
         Ok(())
     }
 

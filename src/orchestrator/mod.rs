@@ -219,7 +219,9 @@ mod tests {
         assert!(should_ignore_path(
             "/repo/frontend/android/app/src/main/assets/public/_app/immutable/chunks/BTLF1Zap2.js"
         ));
-        assert!(should_ignore_path("/repo/frontend/ios/App/App/public/index.html"));
+        assert!(should_ignore_path(
+            "/repo/frontend/ios/App/App/public/index.html"
+        ));
         // Other generated/cache dirs in the same class
         assert!(should_ignore_path("/repo/.turbo/daemon/foo.log"));
         assert!(should_ignore_path("/repo/.parcel-cache/foo.txt"));
@@ -232,13 +234,17 @@ mod tests {
         // "kit" as a real source directory must not be caught by "/.svelte-kit/"
         assert!(!should_ignore_path("/repo/src/kit/foo.ts"));
         // The real route that the generated _page.ts.js above was built FROM
-        assert!(!should_ignore_path("/repo/frontend/src/routes/publish/+page.ts"));
+        assert!(!should_ignore_path(
+            "/repo/frontend/src/routes/publish/+page.ts"
+        ));
         // Real native source must keep being indexed — the Capacitor entries are
         // deliberately scoped to the copied web-asset dirs, not to android/ or ios/
         assert!(!should_ignore_path(
             "/repo/frontend/android/app/src/main/java/com/wayuto/MainActivity.java"
         ));
-        assert!(!should_ignore_path("/repo/frontend/ios/App/App/AppDelegate.swift"));
+        assert!(!should_ignore_path(
+            "/repo/frontend/ios/App/App/AppDelegate.swift"
+        ));
         // A legitimate directory named "output" (no leading dot)
         assert!(!should_ignore_path("/repo/src/output/formatter.rs"));
     }

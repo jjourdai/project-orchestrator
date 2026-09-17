@@ -2498,12 +2498,15 @@ impl Neo4jClient {
     /// from a request body (`POST /api/personas/auto-build` →
     /// `persona_handlers::auto_build_persona`, which defaults it to 3 but
     /// applied no upper bound), so an unclamped value let a caller ask for
-    /// `*1..1000000`. The traversal enumerates trails internally even though
-    /// `DISTINCT callee` bounds the result to the Function count, so cost grows
-    /// with depth (mean CALLS out-degree is ~7) until it exhausts the request
-    /// timeout or Neo4j's transaction memory. Clamping at this chokepoint keeps
-    /// any future caller safe too; 5 matches the bound used by
-    /// `auto_build_feature_graph`.
+    /// `*1..1000000`.
+    ///
+    /// Measured, the depth does NOT drive cost on the current graph: from the
+    /// highest-out-degree function (112 callees), db-hits saturate at ~4,531
+    /// and 11 ms and are identical at depth 4, 5, 6, 8, 12 and 20, because
+    /// relationship-uniqueness exhausts the reachable set within a few hops.
+    /// The clamp is therefore defence-in-depth against a pathological graph
+    /// (or a caller passing an absurd value), not a fix for a measured
+    /// regression — do not cite it as one. 5 matches `auto_build_feature_graph`.
     ///
     /// Known limitation: this is not project-scoped, so results can cross
     /// project boundaries where CALLS edges do (see
@@ -2684,10 +2687,20 @@ impl Neo4jClient {
         max_depth: u32,
     ) -> Result<serde_json::Value> {
         // Parents (traverse EXTENDS upward)
+        //
+        // Both endpoints must carry the :Struct label. Unlabelled, `(child)`
+        // plans as an AllNodesScan with the name filter applied afterwards —
+        // measured at 2,459,229 db-hits / 678 ms against 1.23M nodes, to return
+        // zero rows, and that cost grows with total database size (most of
+        // those nodes are ChatEvents, which have nothing to do with class
+        // hierarchies). Labelled, the same query is 3 db-hits / 13 ms. The
+        // query runs twice per request, so this was ~5M db-hits per call.
+        //
+        // :Struct is the correct label: create_extends_relationships only ever
+        // MERGEs EXTENDS between (:Struct)-[:EXTENDS]->(:Struct).
         let q_parents = query(&format!(
             r#"
-            MATCH path = (child)-[:EXTENDS*1..{}]->(ancestor)
-            WHERE child.name = $type_name
+            MATCH path = (child:Struct {{name: $type_name}})-[:EXTENDS*1..{}]->(ancestor:Struct)
             WITH ancestor, length(path) AS depth
             WHERE depth <= $max_depth
             RETURN DISTINCT ancestor.name AS name,
@@ -2716,8 +2729,7 @@ impl Neo4jClient {
         // Children (traverse EXTENDS downward — reverse direction)
         let q_children = query(&format!(
             r#"
-            MATCH path = (descendant)-[:EXTENDS*1..{}]->(parent)
-            WHERE parent.name = $type_name
+            MATCH path = (descendant:Struct)-[:EXTENDS*1..{}]->(parent:Struct {{name: $type_name}})
             WITH descendant, length(path) AS depth
             WHERE depth <= $max_depth
             RETURN DISTINCT descendant.name AS name,

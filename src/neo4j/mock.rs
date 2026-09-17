@@ -1426,9 +1426,18 @@ impl GraphStore for MockGraphStore {
             for path in &paths {
                 self.files.write().await.remove(path);
                 self.file_symbols.write().await.remove(path);
-                self.functions.write().await.retain(|_, f| f.file_path != *path);
-                self.structs_map.write().await.retain(|_, s| s.file_path != *path);
-                self.imports.write().await.retain(|_, i| i.file_path != *path);
+                self.functions
+                    .write()
+                    .await
+                    .retain(|_, f| f.file_path != *path);
+                self.structs_map
+                    .write()
+                    .await
+                    .retain(|_, s| s.file_path != *path);
+                self.imports
+                    .write()
+                    .await
+                    .retain(|_, i| i.file_path != *path);
             }
             if let Some(stored) = self.project_files.write().await.get_mut(&project_id) {
                 stored.retain(|p| !crate::orchestrator::should_ignore_path(p));
@@ -15172,7 +15181,9 @@ mod tests {
         let elsewhere = "/other/frontend/.svelte-kit/output/x.js".to_string();
 
         for (pid, path) in [(project, &generated), (project, &real), (other, &elsewhere)] {
-            GraphStore::link_file_to_project(&store, path, pid).await.unwrap();
+            GraphStore::link_file_to_project(&store, path, pid)
+                .await
+                .unwrap();
         }
 
         // Dry run reports without touching anything.

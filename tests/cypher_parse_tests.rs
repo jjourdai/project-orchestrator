@@ -30,8 +30,18 @@ use std::path::{Path, PathBuf};
 /// Cypher leading keywords used to decide whether a string literal is a query.
 /// A literal must begin (ignoring whitespace/comments) with one of these.
 const CYPHER_HEADS: &[&str] = &[
-    "MATCH", "OPTIONAL MATCH", "MERGE", "CREATE", "WITH", "UNWIND", "RETURN", "CALL", "SHOW",
-    "DETACH DELETE", "PROFILE", "EXPLAIN",
+    "MATCH",
+    "OPTIONAL MATCH",
+    "MERGE",
+    "CREATE",
+    "WITH",
+    "UNWIND",
+    "RETURN",
+    "CALL",
+    "SHOW",
+    "DETACH DELETE",
+    "PROFILE",
+    "EXPLAIN",
 ];
 
 /// Queries known to be unparseable, deliberately NOT fixed, with the reason.
@@ -173,7 +183,9 @@ fn resolve_placeholders(text: &str) -> Option<(String, bool)> {
     // Doubled braces are literal; hide them while we inspect the rest.
     const L: char = '\u{1}';
     const R: char = '\u{2}';
-    let hidden = text.replace("{{", &L.to_string()).replace("}}", &R.to_string());
+    let hidden = text
+        .replace("{{", &L.to_string())
+        .replace("}}", &R.to_string());
 
     let mut out = String::with_capacity(hidden.len());
     let mut rest = hidden.as_str();
@@ -258,8 +270,7 @@ fn collect_queries() -> (Vec<FoundQuery>, Vec<(PathBuf, usize)>) {
 async fn every_literal_cypher_query_parses() {
     let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".into());
     let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-    let password =
-        std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "orchestrator123".into());
+    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "orchestrator123".into());
 
     let graph = neo4rs::Graph::new(&uri, &user, &password)
         .await
@@ -386,10 +397,7 @@ fn extractor_handles_raw_strings_and_placeholders() {
     let lits = raw_string_literals(src);
     assert_eq!(lits.len(), 3, "expected 3 raw literals, got {}", lits.len());
 
-    let cypher: Vec<_> = lits
-        .iter()
-        .filter(|(_, t)| looks_like_cypher(t))
-        .collect();
+    let cypher: Vec<_> = lits.iter().filter(|(_, t)| looks_like_cypher(t)).collect();
     assert_eq!(cypher.len(), 3, "all three raw literals are Cypher");
 
     // Doubled braces become a real Cypher map; the depth slot becomes a number.

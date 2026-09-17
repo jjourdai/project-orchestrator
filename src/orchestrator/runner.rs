@@ -3221,10 +3221,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     /// only ever contains files whose extension the parser recognises, so a bare
     /// probe cannot accidentally match an extensionless file. An extensionless TS
     /// import simply misses and falls through to the extension list as before.
-    fn probe_module_target(
-        target: &str,
-        index: &crate::resolver::SuffixIndex,
-    ) -> Option<String> {
+    fn probe_module_target(target: &str, index: &crate::resolver::SuffixIndex) -> Option<String> {
         if let Some(resolved) = index.get(target) {
             return Some(resolved.to_string());
         }
@@ -7542,7 +7539,11 @@ mod tests {
 
         // Extensionless module through the alias
         assert_eq!(
-            Orchestrator::resolve_typescript_import_indexed("$lib/api", "src/routes/+page.ts", &index),
+            Orchestrator::resolve_typescript_import_indexed(
+                "$lib/api",
+                "src/routes/+page.ts",
+                &index
+            ),
             Some("src/lib/api.ts".to_string())
         );
         // Component through the alias, extension included
@@ -7602,7 +7603,11 @@ mod tests {
 
         for internal in ["$app/navigation", "$app/stores", "$env/static/public"] {
             assert_eq!(
-                Orchestrator::resolve_typescript_import_indexed(internal, "src/routes/+page.ts", &index),
+                Orchestrator::resolve_typescript_import_indexed(
+                    internal,
+                    "src/routes/+page.ts",
+                    &index
+                ),
                 None,
                 "{internal} must not resolve — it has no file on disk"
             );
