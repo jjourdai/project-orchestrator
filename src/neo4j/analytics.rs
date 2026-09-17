@@ -57,6 +57,10 @@ pub struct LearningHealthReport {
 }
 
 impl Neo4jClient {
+    /// Maximum number of distinct import cycles reported by
+    /// [`Self::get_circular_dependencies`].
+    const CIRCULAR_DEPS_MAX: usize = 10;
+
     /// Get distinct communities for a project (from graph analytics Louvain clustering).
     /// Returns communities sorted by file_count descending.
     pub async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>> {
@@ -704,20 +708,62 @@ impl Neo4jClient {
     }
 
     /// Detect circular dependencies between files (import cycles).
+    ///
+    /// Returns the *shortest* import cycle through each participating file
+    /// (up to [`Self::CIRCULAR_DEPS_MAX`] distinct cycles), shortest first.
+    ///
+    /// # Why this is not a plain variable-length match
+    ///
+    /// The obvious formulation — `MATCH path = (f:File)-[:IMPORTS*2..5]->(f)`
+    /// then `RETURN DISTINCT ... ORDER BY size(...) LIMIT 10` — is unusable at
+    /// any realistic scale, for two independent reasons:
+    ///
+    /// 1. It enumerates every *trail*, not every cycle. Dense mutual-import
+    ///    clusters (e.g. Terraform `.tf` files, which all reference
+    ///    `locals`/`variables`) make the trail count grow ~30x per extra hop.
+    /// 2. The `ORDER BY` forces every trail to be materialized before the
+    ///    `LIMIT` can apply, so the `LIMIT 10` prunes nothing.
+    ///
+    /// Measured on one 374-file project (1101 IMPORTS edges), *already scoped
+    /// to that project*, at depth 2..5 — counting only, without materializing
+    /// the path lists: 25,697,790 cycles, 852,103,780 db-hits, 146 s. Adding
+    /// back the `DISTINCT`/`ORDER BY` materialization exhausted the 5.6 GiB
+    /// transaction-memory limit and aborted after ~2 min. Scoping the start
+    /// nodes to the project does *not* rescue it: import edges never cross
+    /// project boundaries, so scoping only avoids computing *other* projects'
+    /// cycles — the blowup is entirely intra-project.
+    ///
+    /// Instead we take each import edge `a -> b` and ask for a single
+    /// `shortestPath` from `b` back to `a`. `shortestPath` is a bidirectional
+    /// BFS that yields one path per pair rather than all trails, so the cost
+    /// is bounded by the edge count. Same 374-file project: 34,204 db-hits,
+    /// 58 ms — a ~25,000x reduction in db-hits.
+    ///
+    /// The `a <> b` guard is required, not cosmetic: a file that imports
+    /// itself would make `shortestPath` start and end on the same node, which
+    /// Neo4j rejects outright with
+    /// `dbms.cypher.forbid_shortestpath_common_nodes` at its default. Such
+    /// self-loops exist in practice, and the original `*2..5` form excluded
+    /// them anyway.
     pub async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>> {
         let q = query(
             r#"
-            MATCH path = (f:File)-[:IMPORTS*2..5]->(f)
-            WHERE EXISTS { MATCH (p:Project {id: $pid})-[:CONTAINS]->(f) }
-            WITH nodes(path) AS cycle_nodes
-            WITH [n IN cycle_nodes | n.path] AS cycle
-            WITH cycle, cycle[0] AS canonical
-            RETURN DISTINCT cycle
+            MATCH (a:File {project_id: $pid})-[:IMPORTS]->(b:File {project_id: $pid})
+            WHERE a <> b
+            MATCH p = shortestPath((b)-[:IMPORTS*1..4]->(a))
+            WITH a, [a.path] + [x IN nodes(p) | x.path] AS cycle
             ORDER BY size(cycle)
-            LIMIT 10
+            WITH a, head(collect(cycle)) AS cycle
+            RETURN cycle
+            ORDER BY size(cycle)
+            LIMIT $limit
             "#,
         )
-        .param("pid", project_id.to_string());
+        .param("pid", project_id.to_string())
+        // Over-fetch: one row per participating file, so the same A<->B cycle
+        // is reported from both ends. The dedup below collapses those, and we
+        // truncate to CIRCULAR_DEPS_MAX afterwards.
+        .param("limit", (Self::CIRCULAR_DEPS_MAX * 5) as i64);
 
         let rows = self.execute_with_params(q).await?;
         let mut cycles: Vec<Vec<String>> = Vec::new();
@@ -731,6 +777,9 @@ impl Neo4jClient {
                 let key = canonical.join("|");
                 if seen.insert(key) {
                     cycles.push(cycle);
+                    if cycles.len() >= Self::CIRCULAR_DEPS_MAX {
+                        break;
+                    }
                 }
             }
         }
