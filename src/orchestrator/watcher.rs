@@ -866,32 +866,22 @@ async fn resolve_project(
         .map(|(_, ctx)| ctx.clone())
 }
 
-/// Check if a file should be synced based on extension and path
+/// Check if a file should be synced based on extension and path.
 ///
-/// Supports all 21 extensions matching the main sync engine in runner.rs.
+/// The language set is DERIVED from [`SupportedLanguage::from_extension`], the same
+/// source `scan_files` in runner.rs uses. Do not reintroduce a local list: the previous
+/// hand-maintained array had silently drifted by 17 extensions (mjs, cjs, pyi, hh, rake,
+/// gemspec, phtml, php5, php7, zsh, cs, scala, sc, zig, tf, tfvars, dart) while carrying a
+/// comment asserting it was aligned. Those languages were indexed by a full sync but never
+/// re-indexed on save, and nothing errored — the events were just dropped.
+/// `test_should_sync_file_matches_parser_extensions` is what keeps the two in step.
 fn should_sync_file(path: &Path) -> bool {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or_default();
 
-    // All supported languages — must stay aligned with runner.rs sync_directory_for_project()
-    let supported_extensions = [
-        "rs", // Rust
-        "ts", "tsx", "js", "jsx",  // TypeScript/JavaScript
-        "py",   // Python
-        "go",   // Go
-        "java", // Java
-        "c", "h", // C
-        "cpp", "cc", "cxx", "hpp", "hxx", // C++
-        "rb",  // Ruby
-        "php", // PHP
-        "kt", "kts",   // Kotlin
-        "swift", // Swift
-        "sh", "bash", // Bash
-    ];
-
-    if !supported_extensions.contains(&ext) {
+    if crate::parser::SupportedLanguage::from_extension(ext).is_none() {
         return false;
     }
 
@@ -1350,6 +1340,48 @@ mod tests {
         // Files without extension should not be synced
         assert!(!should_sync_file(Path::new("/project/Makefile")));
         assert!(!should_sync_file(Path::new("/project/Dockerfile")));
+    }
+
+    /// The watcher and the full-scan sync MUST accept exactly the same extensions.
+    ///
+    /// This test exists because they silently diverged: `should_sync_file` carried a
+    /// hand-maintained array whose doc comment claimed alignment with runner.rs while
+    /// missing 17 extensions, so those languages were indexed by `project(sync)` but
+    /// NEVER re-indexed by the file watcher. Nothing errored — the events were just
+    /// dropped, and the graph went quietly stale.
+    ///
+    /// Every extension `SupportedLanguage::from_extension` accepts must be watched.
+    /// If you add a language and this fails, fix the code, not the list.
+    #[test]
+    fn test_should_sync_file_matches_parser_extensions() {
+        use crate::parser::SupportedLanguage;
+
+        // DERIVED, not copied. A hand-maintained list here would be the same
+        // mistake one level up: it would stay green while going stale.
+        let parser_extensions = SupportedLanguage::all_extensions();
+
+        let mut not_watched = Vec::new();
+        for ext in parser_extensions {
+            if !should_sync_file(Path::new(&format!("/project/src/file.{ext}"))) {
+                not_watched.push(ext);
+            }
+        }
+
+        assert!(
+            not_watched.is_empty(),
+            "the file watcher ignores {} extension(s) the parser supports, so edits to \
+             those files never re-index: {:?}",
+            not_watched.len(),
+            not_watched
+        );
+    }
+
+    /// `from_extension` lowercases its input; the watcher must not be case-sensitive
+    /// either, or `Main.RS` syncs on a full scan but never on save.
+    #[test]
+    fn test_should_sync_file_is_case_insensitive() {
+        assert!(should_sync_file(Path::new("/project/src/Main.RS")));
+        assert!(should_sync_file(Path::new("/project/src/App.TS")));
     }
 
     // ── resolve_project tests ─────────────────────────────────────────

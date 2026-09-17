@@ -56,6 +56,21 @@ pub const IGNORED_PATH_SEGMENTS: &[&str] = &[
     "/.pytest_cache/",
     "/.ruff_cache/",
     "/__pycache__/",
+    // Build output for languages the watcher only started seeing once its
+    // extension list was derived from the parser rather than hand-maintained.
+    // Without these, a `dotnet build` pushes thousands of generated obj/**/*.cs
+    // events past should_sync_file, resets the debounce repeatedly, and past
+    // BULK_SYNC_THRESHOLD escalates to a full-project re-sync on every build.
+    //
+    // NOT "/bin/": Rust puts real source in src/bin/ (gonnado's ingest-worker
+    // alone has 48 binaries there). C# build output is caught by "/obj/" on its
+    // own, so the risk is not worth the coverage.
+    "/obj/",
+    "/.dart_tool/",
+    // Also added by feat/exclude-generated-vendored-from-sync — expect a trivial
+    // conflict if both land. Needed here independently: .tf became watched in
+    // this change, which would otherwise pull in vendored terraform modules.
+    "/.terraform/",
 ];
 
 /// Check whether a file path should be ignored during sync.

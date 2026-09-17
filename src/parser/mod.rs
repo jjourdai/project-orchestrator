@@ -37,30 +37,71 @@ pub enum SupportedLanguage {
     Dart,
 }
 
+/// Extension -> language. The ONE place an extension is associated with a parser,
+/// so `from_extension` and `all_extensions` cannot drift apart: adding a row is the
+/// only way to teach the parser a new extension, and every consumer reads the same
+/// row. JS/JSX are parsed with the TypeScript grammar.
+const EXTENSION_TABLE: &[(&str, SupportedLanguage)] = &[
+    ("rs", SupportedLanguage::Rust),
+    ("ts", SupportedLanguage::TypeScript),
+    ("tsx", SupportedLanguage::TypeScript),
+    ("js", SupportedLanguage::TypeScript),
+    ("jsx", SupportedLanguage::TypeScript),
+    ("mjs", SupportedLanguage::TypeScript),
+    ("cjs", SupportedLanguage::TypeScript),
+    ("py", SupportedLanguage::Python),
+    ("pyi", SupportedLanguage::Python),
+    ("go", SupportedLanguage::Go),
+    ("java", SupportedLanguage::Java),
+    ("c", SupportedLanguage::C),
+    ("h", SupportedLanguage::C),
+    ("cpp", SupportedLanguage::Cpp),
+    ("cc", SupportedLanguage::Cpp),
+    ("cxx", SupportedLanguage::Cpp),
+    ("hpp", SupportedLanguage::Cpp),
+    ("hxx", SupportedLanguage::Cpp),
+    ("hh", SupportedLanguage::Cpp),
+    ("rb", SupportedLanguage::Ruby),
+    ("rake", SupportedLanguage::Ruby),
+    ("gemspec", SupportedLanguage::Ruby),
+    ("php", SupportedLanguage::Php),
+    ("phtml", SupportedLanguage::Php),
+    ("php5", SupportedLanguage::Php),
+    ("php7", SupportedLanguage::Php),
+    ("kt", SupportedLanguage::Kotlin),
+    ("kts", SupportedLanguage::Kotlin),
+    ("swift", SupportedLanguage::Swift),
+    ("sh", SupportedLanguage::Bash),
+    ("bash", SupportedLanguage::Bash),
+    ("zsh", SupportedLanguage::Bash),
+    ("cs", SupportedLanguage::CSharp),
+    ("scala", SupportedLanguage::Scala),
+    ("sc", SupportedLanguage::Scala),
+    ("zig", SupportedLanguage::Zig),
+    ("tf", SupportedLanguage::Hcl),
+    ("tfvars", SupportedLanguage::Hcl),
+    ("dart", SupportedLanguage::Dart),
+];
+
 impl SupportedLanguage {
     /// Detect language from file extension
     pub fn from_extension(ext: &str) -> Option<Self> {
-        match ext.to_lowercase().as_str() {
-            "rs" => Some(Self::Rust),
-            "ts" | "tsx" => Some(Self::TypeScript),
-            "js" | "jsx" | "mjs" | "cjs" => Some(Self::TypeScript), // Use TS parser for JS
-            "py" | "pyi" => Some(Self::Python),
-            "go" => Some(Self::Go),
-            "java" => Some(Self::Java),
-            "c" | "h" => Some(Self::C),
-            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(Self::Cpp),
-            "rb" | "rake" | "gemspec" => Some(Self::Ruby),
-            "php" | "phtml" | "php5" | "php7" => Some(Self::Php),
-            "kt" | "kts" => Some(Self::Kotlin),
-            "swift" => Some(Self::Swift),
-            "sh" | "bash" | "zsh" => Some(Self::Bash),
-            "cs" => Some(Self::CSharp),
-            "scala" | "sc" => Some(Self::Scala),
-            "zig" => Some(Self::Zig),
-            "tf" | "tfvars" => Some(Self::Hcl),
-            "dart" => Some(Self::Dart),
-            _ => None,
-        }
+        let lower = ext.to_lowercase();
+        EXTENSION_TABLE
+            .iter()
+            .find(|(e, _)| *e == lower)
+            .map(|(_, lang)| *lang)
+    }
+
+    /// Every file extension the parser accepts.
+    ///
+    /// The SINGLE source of truth for "which files are source files", shared by
+    /// `scan_files` (full sync) and `should_sync_file` (the watcher). Both derive
+    /// from [`EXTENSION_TABLE`], so they cannot disagree — which is the point:
+    /// the watcher kept its own copy and drifted by 17 extensions with nothing
+    /// failing.
+    pub fn all_extensions() -> impl Iterator<Item = &'static str> {
+        EXTENSION_TABLE.iter().map(|(ext, _)| *ext)
     }
 
     /// Get the tree-sitter language
@@ -777,6 +818,28 @@ mod tests {
     fn test_all_returns_17_languages() {
         let all = SupportedLanguage::all();
         assert_eq!(all.len(), 17);
+    }
+
+    /// `all_extensions` and `from_extension` must agree in BOTH directions.
+    ///
+    /// One direction alone is not a guard: a list that only has to be a subset
+    /// stays green while it goes stale, which is exactly how the watcher drifted
+    /// by 17 extensions.
+    #[test]
+    fn test_all_extensions_matches_from_extension() {
+        // from_extension and all_extensions both read EXTENSION_TABLE, so they
+        // cannot disagree by construction. What the table does NOT guarantee is
+        // that every language HAS a row — a new variant with no extension would be
+        // unreachable, silently.
+        let covered: std::collections::HashSet<_> = SupportedLanguage::all_extensions()
+            .filter_map(SupportedLanguage::from_extension)
+            .collect();
+        for lang in SupportedLanguage::all() {
+            assert!(
+                covered.contains(lang),
+                "{lang:?} has no extension in all_extensions — add its extension(s) there"
+            );
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ Coordinate multiple AI coding agents with a shared knowledge base.
 - **Multi-Project Support**: Manage multiple codebases with isolated data
 - **Neo4j Knowledge Graph**: Code structure, relationships, plans, decisions
 - **Meilisearch**: Fast semantic search across code and decisions
-- **Tree-sitter**: Precise code parsing for 16 languages
+- **Tree-sitter**: Precise code parsing for 17 languages
 - **Plan Management**: Structured tasks with dependencies and constraints
 - **MCP Integration**: 22 mega-tools for Claude Code, OpenAI Agents, and Cursor
 - **Authentication**: Google OAuth2, OIDC, and Password login + JWT with deny-by-default security
