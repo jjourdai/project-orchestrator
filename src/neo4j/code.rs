@@ -4448,7 +4448,14 @@ impl Neo4jClient {
             OPTIONAL MATCH (f)-[:IMPORTS]->(imp_out:File)
             WITH f, max_pr, max_bt, count(DISTINCT imp_out) AS out_deg
             OPTIONAL MATCH (imp_in:File)-[:IMPORTS]->(f)
-            WITH f, max_pr, max_bt, out_deg + count(DISTINCT imp_in) AS total_degree
+            // `out_deg` must stay a grouping key here and be summed in a
+            // separate WITH: combining it with count() in one projection makes
+            // it an implicitly grouped expression, which Neo4j 5 rejects
+            // outright (42I18). This query used to fail to parse, and the
+            // caller swallows errors via `.unwrap_or(0.0)`, so avg_impact_score
+            // silently reported 0.0 for every project.
+            WITH f, max_pr, max_bt, out_deg, count(DISTINCT imp_in) AS in_deg
+            WITH f, max_pr, max_bt, out_deg + in_deg AS total_degree
 
             // Normalize each signal to 0-1
             WITH f, max_pr, max_bt,
