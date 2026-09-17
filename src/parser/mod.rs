@@ -35,6 +35,7 @@ pub enum SupportedLanguage {
     Zig,
     Hcl,
     Dart,
+    Svelte,
 }
 
 impl SupportedLanguage {
@@ -59,6 +60,7 @@ impl SupportedLanguage {
             "zig" => Some(Self::Zig),
             "tf" | "tfvars" => Some(Self::Hcl),
             "dart" => Some(Self::Dart),
+            "svelte" => Some(Self::Svelte),
             _ => None,
         }
     }
@@ -83,6 +85,12 @@ impl SupportedLanguage {
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
             Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
             Self::Dart => tree_sitter_dart::LANGUAGE.into(),
+            // A .svelte file is markup + <script> + <style>, not one language. There is
+            // no Svelte grammar here on purpose (see languages/svelte.rs): the extractor
+            // masks everything outside <script> and re-parses with this same TypeScript
+            // grammar. The tree parse_file builds from the RAW file is therefore garbage
+            // and is deliberately ignored by svelte::extract.
+            Self::Svelte => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         }
     }
 
@@ -106,6 +114,7 @@ impl SupportedLanguage {
             Self::Zig => "zig",
             Self::Hcl => "hcl",
             Self::Dart => "dart",
+            Self::Svelte => "svelte",
         }
     }
 
@@ -129,6 +138,7 @@ impl SupportedLanguage {
             Self::Zig,
             Self::Hcl,
             Self::Dart,
+            Self::Svelte,
         ]
     }
 }
@@ -164,13 +174,26 @@ impl CodeParser {
         let language = SupportedLanguage::from_extension(ext)
             .context(format!("Unsupported file extension: {}", ext))?;
 
+        // A .svelte file is markup + <script> + <style>; only the script bodies are
+        // parsable code. Mask the rest BEFORE parsing so the component is parsed
+        // ONCE. The mask is the same length as the source, so every position the
+        // extractor records still points at the real file. Parsing the raw markup
+        // and re-parsing the mask afterwards wasted a full-file parse per component.
+        let masked_svelte;
+        let parse_input = if language == SupportedLanguage::Svelte {
+            masked_svelte = languages::svelte::mask_scripts(content);
+            masked_svelte.as_str()
+        } else {
+            content
+        };
+
         let parser = self
             .parsers
             .get_mut(&language)
             .context("Parser not found")?;
 
         let tree = parser
-            .parse(content, None)
+            .parse(parse_input, None)
             .context("Failed to parse file")?;
 
         let root = tree.root_node();
@@ -247,6 +270,10 @@ impl CodeParser {
             }
             SupportedLanguage::Dart => {
                 languages::dart::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Svelte => {
+                // `parse_input` is the masked buffer, not the raw component.
+                languages::svelte::extract(&root, parse_input, &path_str, &mut parsed)?;
             }
         }
 
@@ -435,6 +462,11 @@ mod tests {
             ("a.scala", "object O { def foo(): Int = 1 }\n", "scala"),
             ("a.zig", "fn foo() i32 { return 1; }\n", "zig"),
             (
+                "a.svelte",
+                "<p>hi</p>\n<script lang=\"ts\">\nexport function foo(): number { return 1; }\n</script>\n",
+                "svelte",
+            ),
+            (
                 "a.tf",
                 "resource \"aws_s3_bucket\" \"b\" {\n  bucket = \"x\"\n}\n",
                 "hcl",
@@ -502,7 +534,7 @@ mod tests {
     #[test]
     fn test_supported_language_all_and_as_str() {
         let all = SupportedLanguage::all();
-        assert!(all.len() >= 17, "expected all supported languages");
+        assert!(all.len() >= 18, "expected all supported languages");
         let mut names: Vec<&str> = all.iter().map(|l| l.as_str()).collect();
         let n = names.len();
         names.sort_unstable();
@@ -771,17 +803,19 @@ mod tests {
         assert_eq!(SupportedLanguage::Zig.as_str(), "zig");
         assert_eq!(SupportedLanguage::Hcl.as_str(), "hcl");
         assert_eq!(SupportedLanguage::Dart.as_str(), "dart");
+        assert_eq!(SupportedLanguage::Svelte.as_str(), "svelte");
     }
 
     #[test]
-    fn test_all_returns_17_languages() {
+    fn test_all_returns_18_languages() {
         let all = SupportedLanguage::all();
-        assert_eq!(all.len(), 17);
+        assert_eq!(all.len(), 18);
     }
 
     #[test]
     fn test_all_contains_all_variants() {
         let all = SupportedLanguage::all();
+        assert!(all.contains(&SupportedLanguage::Svelte));
         assert!(all.contains(&SupportedLanguage::Rust));
         assert!(all.contains(&SupportedLanguage::TypeScript));
         assert!(all.contains(&SupportedLanguage::Python));

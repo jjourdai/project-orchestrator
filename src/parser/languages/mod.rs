@@ -16,6 +16,7 @@ pub mod python;
 pub mod ruby;
 pub mod rust;
 pub mod scala;
+pub mod svelte;
 pub mod swift;
 pub mod typescript;
 pub mod zig;
