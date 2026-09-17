@@ -2216,3 +2216,252 @@ class Documented {
     let do_stuff = parsed.functions.iter().find(|f| f.name == "doStuff");
     assert!(do_stuff.is_some(), "Should find doStuff method");
 }
+
+// ============================================================================
+// Svelte tests
+// ============================================================================
+//
+// There is no Svelte grammar: the extractor masks everything outside <script>
+// and re-parses with the TypeScript grammar. The line-number test below is the
+// one that matters — it is what distinguishes masking from slicing, and slicing
+// fails silently (wrong anchors in Neo4j, nothing errors).
+
+#[test]
+fn test_parse_svelte_line_numbers_match_the_component_not_the_script() {
+    let mut parser = CodeParser::new().unwrap();
+
+    // Markup deliberately ABOVE the script, so a sliced implementation would
+    // report line numbers relative to the <script> body and be visibly wrong.
+    let code = r#"<div class="wrapper">
+  <h1>Title</h1>
+  <p>Some copy that pushes the script down the file.</p>
+  <span>More markup.</span>
+</div>
+
+<script lang="ts">
+	export function greet(name: string): string {
+		return `hello ${name}`;
+	}
+</script>
+
+<style>
+  .wrapper { color: red; }
+</style>
+"#;
+
+    let parsed = parser
+        .parse_file(Path::new("Greeter.svelte"), code)
+        .expect("should parse a Svelte component");
+
+    assert_eq!(parsed.language, "svelte");
+
+    let greet = parsed
+        .functions
+        .iter()
+        .find(|f| f.name == "greet")
+        .unwrap_or_else(|| {
+            panic!(
+                "should find greet(), got: {:?}",
+                parsed.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+            )
+        });
+
+    // `export function greet` is on line 8 of the component (1-indexed).
+    // A slicing implementation would report 2 — its offset inside the script body.
+    assert_eq!(
+        greet.line_start, 8,
+        "line_start must be the line in the .svelte FILE, not inside the <script> block. \
+         Got {} — this is what a sliced (rather than masked) implementation produces.",
+        greet.line_start
+    );
+}
+
+#[test]
+fn test_parse_svelte_extracts_both_script_blocks() {
+    let mut parser = CodeParser::new().unwrap();
+
+    // A component may carry an instance script AND a module script. Taking only
+    // the first match would silently drop half the symbols.
+    let code = r#"<script context="module" lang="ts">
+	export function fromModule(): number {
+		return 1;
+	}
+</script>
+
+<p>markup between the two blocks</p>
+
+<script lang="ts">
+	export function fromInstance(): number {
+		return 2;
+	}
+</script>
+"#;
+
+    let parsed = parser
+        .parse_file(Path::new("Two.svelte"), code)
+        .expect("should parse a two-script component");
+
+    let names: Vec<&String> = parsed.functions.iter().map(|f| &f.name).collect();
+    assert!(
+        names.iter().any(|n| *n == "fromModule"),
+        "should find the module-script function, got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| *n == "fromInstance"),
+        "should find the instance-script function, got {names:?}"
+    );
+}
+
+#[test]
+fn test_parse_svelte_extracts_imports() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"<script lang="ts">
+	import { onMount } from 'svelte';
+	import Card from '$lib/components/Card.svelte';
+</script>
+
+<Card />
+"#;
+
+    let parsed = parser
+        .parse_file(Path::new("Uses.svelte"), code)
+        .expect("should parse");
+
+    let paths: Vec<&String> = parsed.imports.iter().map(|i| &i.path).collect();
+    assert!(
+        paths.iter().any(|p| p.contains("svelte")),
+        "should extract the svelte import, got {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.contains("Card.svelte")),
+        "should extract the $lib component import, got {paths:?}"
+    );
+}
+
+#[test]
+fn test_parse_svelte_markup_only_component_is_not_an_error() {
+    let mut parser = CodeParser::new().unwrap();
+
+    // A presentational component with no <script> is perfectly valid and must
+    // parse to zero symbols rather than failing the file.
+    let code = "<div class=\"badge\">\n  <slot />\n</div>\n";
+
+    let parsed = parser
+        .parse_file(Path::new("Badge.svelte"), code)
+        .expect("a markup-only component must not error");
+
+    assert_eq!(parsed.language, "svelte");
+    assert!(
+        parsed.functions.is_empty(),
+        "expected no functions, got {:?}",
+        parsed.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_parse_svelte_ignores_markup_that_looks_like_code() {
+    let mut parser = CodeParser::new().unwrap();
+
+    // `{#each}` blocks and handlebars-ish markup must not be mistaken for
+    // TypeScript. Masking makes this structural rather than a matter of luck.
+    let code = r#"<script lang="ts">
+	export function real(): void {}
+</script>
+
+{#each items as item}
+  <button onclick={() => notAFunction(item)}>{item.label}</button>
+{/each}
+"#;
+
+    let parsed = parser
+        .parse_file(Path::new("List.svelte"), code)
+        .expect("should parse");
+
+    let names: Vec<&String> = parsed.functions.iter().map(|f| &f.name).collect();
+    assert!(names.iter().any(|n| *n == "real"), "got {names:?}");
+    assert!(
+        !names.iter().any(|n| *n == "notAFunction"),
+        "markup must not contribute symbols, got {names:?}"
+    );
+}
+
+/// Svelte 5 generics put a `>` inside an attribute value. Closing the opening tag
+/// at the first `>` shifts the body start into the tag and eats the first import.
+#[test]
+fn test_parse_svelte_generics_attribute_containing_angle_bracket() {
+    let mut parser = CodeParser::new().unwrap();
+    let code = r#"<script lang="ts" generics="T extends Item<K>, K">
+	import { onMount } from 'svelte';
+	export function first(): number { return 1; }
+</script>
+
+<div />
+"#;
+    let parsed = parser
+        .parse_file(Path::new("Generic.svelte"), code)
+        .expect("should parse");
+
+    assert!(
+        parsed.imports.iter().any(|i| i.path.contains("svelte")),
+        "the first import must survive a generics attribute, got {:?}",
+        parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>()
+    );
+    assert!(parsed.functions.iter().any(|f| f.name == "first"));
+}
+
+/// A commented-out <script> is not code. Indexing it invents symbols that are not
+/// in the built component and that nothing can ever call.
+#[test]
+fn test_parse_svelte_ignores_script_inside_an_html_comment() {
+    let mut parser = CodeParser::new().unwrap();
+    let code = r#"<!--
+<script lang="ts">
+	import ghostpkg from 'ghostpkg';
+	export function phantom(): void {}
+</script>
+-->
+
+<script lang="ts">
+	export function real(): void {}
+</script>
+"#;
+    let parsed = parser
+        .parse_file(Path::new("Commented.svelte"), code)
+        .expect("should parse");
+
+    let names: Vec<&String> = parsed.functions.iter().map(|f| &f.name).collect();
+    assert!(names.iter().any(|n| *n == "real"), "got {names:?}");
+    assert!(
+        !names.iter().any(|n| *n == "phantom"),
+        "a commented-out script must contribute nothing, got {names:?}"
+    );
+    assert!(
+        !parsed.imports.iter().any(|i| i.path.contains("ghostpkg")),
+        "nor its imports, got {:?}",
+        parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>()
+    );
+}
+
+/// A self-closing `<script src=... />` has no body and no closing tag. Scanning
+/// forward for `</script` from there lands on the NEXT block's terminator and
+/// swallows it whole.
+#[test]
+fn test_parse_svelte_self_closing_src_script_does_not_eat_the_next_block() {
+    let mut parser = CodeParser::new().unwrap();
+    let code = r#"<script src="https://cdn.example/x.js" />
+
+<script lang="ts">
+	export function survives(): number { return 1; }
+</script>
+"#;
+    let parsed = parser
+        .parse_file(Path::new("Cdn.svelte"), code)
+        .expect("should parse");
+
+    assert!(
+        parsed.functions.iter().any(|f| f.name == "survives"),
+        "the real script after a self-closing one must still be read, got {:?}",
+        parsed.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+}
