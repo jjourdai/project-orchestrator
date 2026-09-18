@@ -125,7 +125,15 @@ pub async fn collect_episode(
 
     // 6. Assemble the Episode
     let episode = Episode {
-        id: Uuid::new_v4(),
+        // Derive the id from the source run instead of minting a fresh v4.
+        //
+        // An episode IS a projection of its run, so its identity must be a
+        // function of that run. With a random id per call, `collect` returned
+        // an identifier that `list` never reproduced and no action could look
+        // up — two calls about the same run answered with two different
+        // episodes. A v5 (namespace + run id) is stable across calls and
+        // across restarts.
+        id: Uuid::new_v5(&Uuid::NAMESPACE_OID, run_id.as_bytes()),
         project_id,
         stimulus,
         process,
@@ -229,6 +237,24 @@ impl DistillationBundle {
 
 #[cfg(test)]
 mod tests {
+    /// An episode IS a projection of its source run, so its identity must be a
+    /// function of that run. A fresh v4 per call meant `collect` returned an id
+    /// that `list` never reproduced and no action could look up.
+    #[test]
+    fn episode_id_is_stable_for_a_given_run() {
+        let run = Uuid::parse_str("2326f8a4-a481-44ed-b4c9-9c2686d54c34").unwrap();
+        let a = Uuid::new_v5(&Uuid::NAMESPACE_OID, run.as_bytes());
+        let b = Uuid::new_v5(&Uuid::NAMESPACE_OID, run.as_bytes());
+        assert_eq!(a, b, "same run must yield the same episode id");
+
+        let other = Uuid::parse_str("9b12351e-0000-4000-8000-000000000000").unwrap();
+        assert_ne!(
+            a,
+            Uuid::new_v5(&Uuid::NAMESPACE_OID, other.as_bytes()),
+            "different runs must yield different episode ids"
+        );
+    }
+
     use super::*;
     use chrono::Utc;
 

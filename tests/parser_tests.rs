@@ -935,6 +935,66 @@ end
 }
 
 #[test]
+fn test_parse_ruby_mixins_become_interfaces() {
+    let mut parser = CodeParser::new().unwrap();
+
+    // In Ruby a mixin IS the interface mechanism. `extend` is excluded on
+    // purpose: it adds class-level methods, a different relationship.
+    let code = r#"
+module Serializable
+  def to_h; {}; end
+end
+
+module Comparable2
+  def cmp(o); 0; end
+end
+
+module ClassMethods
+  def build; new; end
+end
+
+class User < BaseEntity
+  include Serializable
+  prepend Comparable2
+  extend ClassMethods
+
+  def name; @name; end
+end
+"#;
+
+    let parsed = parser
+        .parse_file(Path::new("user.rb"), code)
+        .expect("should parse Ruby");
+
+    let user = parsed
+        .structs
+        .iter()
+        .find(|s| s.name == "User")
+        .expect("should find class User");
+
+    assert_eq!(
+        user.parent_class.as_deref(),
+        Some("BaseEntity"),
+        "single inheritance must still resolve"
+    );
+    assert!(
+        user.interfaces.contains(&"Serializable".to_string()),
+        "include must be captured, got {:?}",
+        user.interfaces
+    );
+    assert!(
+        user.interfaces.contains(&"Comparable2".to_string()),
+        "prepend must be captured, got {:?}",
+        user.interfaces
+    );
+    assert!(
+        !user.interfaces.contains(&"ClassMethods".to_string()),
+        "extend must NOT be captured as an interface, got {:?}",
+        user.interfaces
+    );
+}
+
+#[test]
 fn test_parse_php() {
     let mut parser = CodeParser::new().unwrap();
 

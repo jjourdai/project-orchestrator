@@ -186,8 +186,54 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
         line_end: node.end_position().row as u32 + 1,
         docstring,
         parent_class,
-        interfaces: vec![],
+        interfaces: extract_ruby_mixins(node, source),
     })
+}
+
+/// Extract `include` / `prepend` mixins from a class body.
+///
+/// The module doc has always advertised "Mixins (include/extend)", but the
+/// field was hardcoded empty, so a Ruby class that mixes in a module produced
+/// no IMPLEMENTS relation at all — the same blind spot Python had with its
+/// second base class. In Ruby a mixin IS the interface mechanism, so dropping
+/// it loses the whole notion.
+///
+/// `extend` is deliberately excluded: it adds SINGLETON (class-level) methods,
+/// which is not the same relationship as including an instance-level module.
+fn extract_ruby_mixins(node: &tree_sitter::Node, source: &str) -> Vec<String> {
+    let Some(body) = node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+    let mut mixins = Vec::new();
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() != "call" {
+            continue;
+        }
+        let is_mixin = child
+            .child_by_field_name("method")
+            .and_then(|m| get_text(&m, source))
+            .map(|m| m == "include" || m == "prepend")
+            .unwrap_or(false);
+        if !is_mixin {
+            continue;
+        }
+        let Some(args) = child.child_by_field_name("arguments") else {
+            continue;
+        };
+        let mut arg_cursor = args.walk();
+        for arg in args.children(&mut arg_cursor) {
+            if arg.kind() == "constant" || arg.kind() == "scope_resolution" {
+                if let Some(name) = get_text(&arg, source) {
+                    let name = name.trim().to_string();
+                    if !name.is_empty() && !mixins.contains(&name) {
+                        mixins.push(name);
+                    }
+                }
+            }
+        }
+    }
+    mixins
 }
 
 fn extract_module(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<TraitNode> {
