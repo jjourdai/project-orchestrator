@@ -368,11 +368,7 @@ async fn deduplicate_observation(
     note_type_filter: &str,
 ) -> bool {
     let first_line = content.lines().nth(2).unwrap_or(content);
-    let search_query = if first_line.len() > 100 {
-        &first_line[..100]
-    } else {
-        first_line
-    };
+    let search_query = crate::utils::truncate_chars(first_line, 100);
 
     match search
         .search_notes_with_scores(search_query, 3, None, Some(note_type_filter), None, None)

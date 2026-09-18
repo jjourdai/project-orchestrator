@@ -1315,7 +1315,7 @@ impl Neo4jClient {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or_else(chrono::Utc::now),
                 summary: if summary.len() > 200 {
-                    format!("{}...", &summary[..200])
+                    format!("{}...", crate::utils::truncate_chars(&summary, 200))
                 } else {
                     summary
                 },

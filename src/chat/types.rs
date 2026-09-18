@@ -1323,7 +1323,7 @@ impl SessionWorkLog {
             "Bash" => {
                 // Track bash commands as decisions for context
                 if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-                    let short = if cmd.len() > 80 { &cmd[..80] } else { cmd };
+                    let short = crate::utils::truncate_chars(cmd, 80);
                     self.decisions_summary.push(format!("bash: {}", short));
                     // Cap decisions to avoid unbounded growth
                     if self.decisions_summary.len() > 20 {

@@ -2727,7 +2727,11 @@ impl ToolHandler {
                         "note_id": note_id.to_string(),
                         "note_type": note.get("note_type"),
                         "content_preview": note.get("content").and_then(|c| c.as_str()).map(|c| {
-                            if c.len() > 200 { format!("{}...", &c[..200]) } else { c.to_string() }
+                            if c.len() > 200 {
+                                format!("{}...", crate::utils::truncate_chars(c, 200))
+                            } else {
+                                c.to_string()
+                            }
                         }),
                         "rfc_run": run,
                         "tags": note.get("tags"),
