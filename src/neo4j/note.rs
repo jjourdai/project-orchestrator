@@ -35,6 +35,7 @@ impl Neo4jClient {
                 last_confirmed_by: $last_confirmed_by,
                 staleness_score: $staleness_score,
                 energy: $energy,
+                energy_base: $energy_base,
                 last_activated: datetime($last_activated),
                 changes_json: $changes_json,
                 assertion_rule_json: $assertion_rule_json,
@@ -70,6 +71,7 @@ impl Neo4jClient {
         )
         .param("staleness_score", note.staleness_score)
         .param("energy", note.energy)
+        .param("energy_base", note.energy_base)
         .param(
             "last_activated",
             note.last_activated.unwrap_or(note.created_at).to_rfc3339(),
@@ -1779,6 +1781,10 @@ impl Neo4jClient {
                     WHEN coalesce(n.energy, 1.0) + 0.3 > 1.0 THEN 1.0
                     ELSE coalesce(n.energy, 1.0) + 0.3
                 END,
+                n.energy_base = CASE
+                    WHEN coalesce(n.energy, 1.0) + 0.3 > 1.0 THEN 1.0
+                    ELSE coalesce(n.energy, 1.0) + 0.3
+                END,
                 n.last_activated = datetime()
             RETURN n
             "#,
@@ -2651,35 +2657,47 @@ impl Neo4jClient {
         Ok(weights)
     }
 
-    /// Apply exponential energy decay to all active notes.
+    /// Refresh the materialised `energy` of every active note.
     ///
-    /// Formula: `energy = energy × exp(-days_idle / half_life)`
+    /// Formula: `energy = energy_base × exp(-days_idle / half_life)`
     /// where `days_idle = (now - last_activated).days()`.
     ///
-    /// **Temporally idempotent**: the result depends only on the absolute elapsed
-    /// time since `last_activated`, NOT on how often this function is called.
-    /// Calling it once after 30 days ≡ calling it daily for 30 days.
+    /// **Temporally idempotent** — and this time it really is. The decay is
+    /// recomputed from `energy_base`, which only activation paths write, so
+    /// the result depends solely on elapsed idle time and not on how often
+    /// the job ran. The previous version decayed `n.energy` *in place* while
+    /// leaving `last_activated` untouched, so every pass re-applied the whole
+    /// idle period to an already-decayed value: at 4 passes/day the intended
+    /// `exp(-J/14)` became `exp(-J(J+1)/7)`, and 93 % of active notes sat at
+    /// exactly 0.0. The docstring claiming idempotence is what hid it.
     ///
-    /// Notes decaying below 0.05 are floored to 0.0 ("dead neuron").
+    /// Notes below [`ENERGY_CLAMP_FLOOR`] are flushed to 0.0 ("dead neuron"),
+    /// but — unlike before — they are not excluded from the query, so a note
+    /// that gets boosted back to life is picked up again on the next pass.
     pub async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
         let q = query(
             r#"
             MATCH (n:Note)
             WHERE n.status = 'active'
-              AND n.energy > 0.0
               AND n.last_activated IS NOT NULL
             WITH n,
+                 coalesce(n.energy_base, n.energy, 1.0) AS base,
                  duration.between(datetime(n.last_activated), datetime()).days AS days_idle
-            WITH n,
-                 n.energy * exp(-1.0 * toFloat(days_idle) / $half_life) AS new_energy
-            WITH n,
-                 CASE WHEN new_energy < 0.05 THEN 0.0 ELSE new_energy END AS clamped_energy
-            WHERE abs(n.energy - clamped_energy) > 0.001
-            SET n.energy = clamped_energy
+            WITH n, base,
+                 CASE WHEN days_idle <= 0 THEN base
+                      ELSE base * exp(-1.0 * toFloat(days_idle) / $half_life)
+                 END AS new_energy
+            WITH n, base,
+                 CASE WHEN new_energy < $floor THEN 0.0 ELSE new_energy END AS clamped_energy
+            WHERE abs(coalesce(n.energy, -1.0) - clamped_energy) > 0.0001
+               OR n.energy_base IS NULL
+            SET n.energy = clamped_energy,
+                n.energy_base = base
             RETURN count(n) AS updated
             "#,
         )
-        .param("half_life", half_life_days);
+        .param("half_life", half_life_days)
+        .param("floor", crate::notes::energy::ENERGY_CLAMP_FLOOR);
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
@@ -2690,8 +2708,24 @@ impl Neo4jClient {
         }
     }
 
-    /// Boost a note's energy by `amount` (capped at 1.0) and reset `last_activated` to now.
-    /// Boost a note's energy.
+    /// Boost a note's energy by `amount` (capped at 1.0), and re-anchor the
+    /// decay: `energy_base` and `last_activated` both move to now.
+    ///
+    /// This is *the* activation path for a note — chat context injection,
+    /// neuron search, commit linkage, Claude Code hooks all land here — so it
+    /// is also where `activation_count` is incremented. Nothing incremented
+    /// it before: unlike Skill and Persona, which both have an explicit
+    /// `SET x.activation_count = x.activation_count + 1`, `Note.activation_count`
+    /// was written at creation and never again. Everything reading it read a
+    /// structural zero (`pipeline::metrics` learning_hit_rate, the
+    /// auto-learned promotion rule), and `consolidate_memory`'s dead-note rule
+    /// only avoided mass archival because its caller silently falls back to
+    /// synaptic degree.
+    ///
+    /// The boost is added to the note's *current* decayed energy, recomputed
+    /// here with the one canonical law. It used to apply a second, different
+    /// decay of its own — `0.5^(days/90)` — on top of the value the decay job
+    /// had already discounted, charging the same idle days twice.
     ///
     /// Returns whether a note was actually updated. A zero-row MATCH is not an
     /// error in Cypher, so callers that counted `is_ok()` were counting
@@ -2702,17 +2736,27 @@ impl Neo4jClient {
             r#"
             MATCH (n:Note {id: $id})
             WITH n,
+                 coalesce(n.energy_base, n.energy, 1.0) AS base,
                  CASE WHEN n.last_activated IS NOT NULL
-                      THEN n.energy * (0.5 ^ (duration.between(n.last_activated, datetime()).days / 90.0))
-                      ELSE coalesce(n.energy, 1.0)
+                      THEN duration.between(datetime(n.last_activated), datetime()).days
+                      ELSE 0
+                 END AS days_idle
+            WITH n,
+                 CASE WHEN days_idle <= 0 THEN base
+                      ELSE base * exp(-1.0 * toFloat(days_idle) / $half_life)
                  END AS current_e
-            SET n.energy = CASE WHEN current_e + $amount > 1.0 THEN 1.0 ELSE current_e + $amount END,
-                n.last_activated = datetime()
+            WITH n,
+                 CASE WHEN current_e + $amount > 1.0 THEN 1.0 ELSE current_e + $amount END AS new_e
+            SET n.energy = new_e,
+                n.energy_base = new_e,
+                n.last_activated = datetime(),
+                n.activation_count = coalesce(n.activation_count, 0) + 1
             RETURN count(n) AS updated
             "#,
         )
         .param("id", note_id.to_string())
-        .param("amount", amount);
+        .param("amount", amount)
+        .param("half_life", crate::notes::energy::ENERGY_HALF_LIFE_DAYS);
 
         let mut result = self.graph.execute(q).await?;
         let updated = match result.next().await? {
@@ -3063,23 +3107,35 @@ impl Neo4jClient {
         let lifecycle = NoteLifecycleManager::new();
         let now = chrono::Utc::now();
 
-        // 1. Fetch all active notes (not just non-consolidated, since we also archive)
+        // 1. Fetch a batch of active notes, LOWEST energy first.
+        //
+        // This used to be `ORDER BY n.energy DESC` while the whole point of
+        // the pass is to retire depleted notes: the 500-note window was filled
+        // with the healthiest notes in the graph and the actual candidates
+        // were reached a handful at a time, spreading the purge over months
+        // instead of surfacing it in one visible cycle. Measured before the
+        // fix: 33 eligible notes, 6 of them inside the window.
+        const CONSOLIDATION_BATCH: i64 = 500;
         let q = query(
             r#"
             MATCH (n:Note)
             WHERE n.status = 'active'
             OPTIONAL MATCH (n)-[s:SYNAPSE]-()
             RETURN n, count(s) AS synapse_count
-            ORDER BY n.energy DESC
-            LIMIT 500
+            ORDER BY coalesce(n.energy, 1.0) ASC
+            LIMIT $batch
             "#,
-        );
+        )
+        .param("batch", CONSOLIDATION_BATCH);
 
         let mut result = self.graph.execute(q).await?;
         let mut promoted = 0usize;
         let mut archived = 0usize;
 
+        let mut scanned = 0usize;
+
         while let Some(row) = result.next().await? {
+            scanned += 1;
             let node = row.get::<neo4rs::Node>("n")?;
             let note = self.node_to_note(&node)?;
             let synapse_count = row.get::<i64>("synapse_count").unwrap_or(0);
@@ -3102,7 +3158,8 @@ impl Neo4jClient {
                     r#"
                     MATCH (n:Note {id: $id})
                     SET n.status = 'archived',
-                        n.changes_json = $changes_json
+                        n.changes_json = $changes_json,
+                        n.updated_at = datetime()
                     "#,
                 )
                 .param("id", note.id.to_string())
@@ -3129,7 +3186,8 @@ impl Neo4jClient {
                     r#"
                     MATCH (n:Note {id: $id})
                     SET n.status = 'archived',
-                        n.changes_json = $changes_json
+                        n.changes_json = $changes_json,
+                        n.updated_at = datetime()
                     "#,
                 )
                 .param("id", note.id.to_string())
@@ -3219,6 +3277,35 @@ impl Neo4jClient {
             }
         }
 
+        // The batch is bounded, so a cycle can leave work behind. Say so
+        // rather than reporting a tidy "N archived" that reads as "done":
+        // a silent cap is indistinguishable from full coverage.
+        if scanned as i64 == CONSOLIDATION_BATCH {
+            let leftover_q = query(
+                r#"
+                MATCH (n:Note)
+                WHERE n.status = 'active'
+                RETURN count(n) AS total
+                "#,
+            );
+            let mut leftover = self.graph.execute(leftover_q).await?;
+            if let Some(row) = leftover.next().await? {
+                let total: i64 = row.get("total").unwrap_or(0);
+                let remaining = (total - CONSOLIDATION_BATCH).max(0);
+                if remaining > 0 {
+                    tracing::info!(
+                        scanned = scanned,
+                        remaining = remaining,
+                        promoted = promoted,
+                        archived = archived,
+                        "consolidate_memory: batch full, {} active notes left \
+                         outside this cycle's window",
+                        remaining
+                    );
+                }
+            }
+        }
+
         Ok((promoted, archived))
     }
 
@@ -3227,9 +3314,10 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (n:Note)
-            WHERE n.energy IS NULL
-            SET n.energy = 1.0,
-                n.last_activated = coalesce(n.last_confirmed_at, n.created_at, datetime())
+            WHERE n.energy IS NULL OR n.energy_base IS NULL
+            SET n.energy = coalesce(n.energy, 1.0),
+                n.energy_base = coalesce(n.energy_base, n.energy, 1.0),
+                n.last_activated = coalesce(n.last_activated, n.last_confirmed_at, n.created_at, datetime())
             RETURN count(n) AS updated
             "#,
         );
@@ -3412,6 +3500,9 @@ impl Neo4jClient {
             last_confirmed_by: node.get("last_confirmed_by").ok(),
             staleness_score: node.get("staleness_score").unwrap_or(0.0),
             energy: node.get("energy").unwrap_or(1.0),
+            energy_base: node
+                .get("energy_base")
+                .unwrap_or_else(|_| node.get("energy").unwrap_or(1.0)),
             scar_intensity: node.get("scar_intensity").unwrap_or(0.0),
             memory_horizon: node
                 .get::<String>("memory_horizon")

@@ -115,6 +115,7 @@ mod tests {
             last_confirmed_by: None,
             staleness_score: 0.0,
             energy: 0.8,
+            energy_base: 0.8,
             last_activated: None,
             reactivation_count: 0,
             last_reactivated: None,

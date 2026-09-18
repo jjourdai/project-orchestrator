@@ -1685,6 +1685,7 @@ mod tests {
             last_confirmed_by: None,
             staleness_score: 0.0,
             energy,
+            energy_base: energy,
             last_activated: None,
             reactivation_count: 0,
             last_reactivated: None,

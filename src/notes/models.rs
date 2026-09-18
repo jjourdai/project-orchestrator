@@ -697,13 +697,23 @@ pub struct Note {
     pub staleness_score: f64,
 
     // Neural energy (Phase 2)
-    /// Neural energy level (0.0-1.0). Represents "freshness" via exponential decay.
-    /// Starts at 1.0 on creation, decays with half_life=90 days, boosted on activation.
-    /// Coexists with staleness_score for dual-run comparison (Phase 3).
+    /// Neural energy level (0.0-1.0), a **materialised cache** of
+    /// `energy_base × exp(-days_since(last_activated) / half_life)`.
+    ///
+    /// Refreshed by `update_energy_scores` so Cypher can order and filter on
+    /// it. Never decay it in place: see [`crate::notes::energy`] for why that
+    /// turned an exponential law into a quadratic one.
     #[serde(default = "default_energy")]
     pub energy: f64,
+    /// Energy at the instant of the last activation — the immutable base the
+    /// decay is computed *from*.
+    ///
+    /// Written only by activation paths (boost, confirm, creation), never by
+    /// the decay job. This is what makes the decay idempotent in time.
+    #[serde(default = "default_energy")]
+    pub energy_base: f64,
     /// When this note's neuron was last activated (retrieved/used/confirmed).
-    /// Used to compute energy decay: energy × exp(-days_idle / half_life).
+    /// Anchors the decay: `energy = energy_base × exp(-days_idle / half_life)`.
     pub last_activated: Option<DateTime<Utc>>,
 
     // Re-activation tracking (boucle-3: knowledge route quality proxy)
@@ -786,6 +796,7 @@ impl Note {
             last_confirmed_by: Some(created_by.clone()),
             staleness_score: 0.0,
             energy: 1.0,
+            energy_base: 1.0,
             last_activated: Some(now),
             reactivation_count: 0,
             last_reactivated: None,
@@ -806,18 +817,21 @@ impl Note {
         }
     }
 
-    /// Compute current energy using lazy decay formula (boucle-1).
-    /// E(t) = energy × 0.5^((now - last_activated).days / 90.0)
-    /// Falls back to stored energy if last_activated is None.
+    /// Current energy, computed from the immutable base rather than from the
+    /// cached `energy` field.
+    ///
+    /// `E(t) = energy_base × exp(-days_idle / ENERGY_HALF_LIFE_DAYS)`, the
+    /// same law `update_energy_scores` materialises in Neo4j — so a reader
+    /// and the decay job can no longer disagree.
+    ///
+    /// This used to run its own `0.5^(days/90)` law on top of the `energy`
+    /// value the job had *already* decayed, charging idle time twice.
     pub fn computed_energy(&self) -> f64 {
+        use crate::notes::energy::{decayed_energy, ENERGY_HALF_LIFE_DAYS};
         match self.last_activated {
             Some(last) => {
                 let days_idle = (Utc::now() - last).num_seconds() as f64 / 86400.0;
-                if days_idle <= 0.0 {
-                    self.energy
-                } else {
-                    self.energy * (0.5_f64).powf(days_idle / 90.0)
-                }
+                decayed_energy(self.energy_base, days_idle, ENERGY_HALF_LIFE_DAYS)
             }
             None => self.energy,
         }
@@ -858,6 +872,7 @@ impl Note {
             last_confirmed_by: Some(created_by.clone()),
             staleness_score: 0.0,
             energy: 1.0,
+            energy_base: 1.0,
             last_activated: Some(now),
             reactivation_count: 0,
             last_reactivated: None,
@@ -1607,12 +1622,25 @@ mod tests {
             "test".to_string(),
         );
         note.energy = 1.0;
+        note.energy_base = 1.0;
         note.last_activated = Some(Utc::now() - chrono::Duration::days(90));
         let ce = note.computed_energy();
+        // exp(-90/14) ≈ 0.0016, under the clamp floor: a note untouched for
+        // three months is a dead neuron. This used to assert ~0.5, from the
+        // separate `0.5^(days/90)` law computed_energy ran on top of the
+        // energy the decay job had already discounted — the same idle days
+        // billed twice, under two different half-lives.
+        assert_eq!(
+            ce, 0.0,
+            "90-day-old note computed_energy ({ce}) should be flushed to zero"
+        );
+
+        // 14 days idle — one time constant — must land on 1/e.
+        note.last_activated = Some(Utc::now() - chrono::Duration::days(14));
+        let ce = note.computed_energy();
         assert!(
-            (ce - 0.5).abs() < 0.05,
-            "90-day-old note computed_energy ({}) should be ~0.5",
-            ce
+            (ce - (-1.0f64).exp()).abs() < 0.01,
+            "14-day-old note computed_energy ({ce}) should be ~1/e"
         );
     }
 

@@ -6205,19 +6205,25 @@ impl GraphStore for MockGraphStore {
     // ========================================================================
 
     async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        // Mirrors Neo4jNoteStore::update_energy_scores: recompute from the
+        // immutable `energy_base`, never from the previous output. Notes at
+        // 0.0 stay in scope so a boosted note is picked up again.
         let mut notes = self.notes.write().await;
         let now = chrono::Utc::now();
         let mut updated = 0usize;
 
         for note in notes.values_mut() {
-            if note.status != crate::notes::NoteStatus::Active || note.energy <= 0.0 {
+            if note.status != crate::notes::NoteStatus::Active {
                 continue;
             }
             if let Some(last_activated) = note.last_activated {
                 let days_idle = (now - last_activated).num_seconds() as f64 / 86400.0;
-                let new_energy = note.energy * (-days_idle / half_life_days).exp();
-                let clamped = if new_energy < 0.05 { 0.0 } else { new_energy };
-                if (note.energy - clamped).abs() > 0.001 {
+                let clamped = crate::notes::energy::decayed_energy(
+                    note.energy_base,
+                    days_idle,
+                    half_life_days,
+                );
+                if (note.energy - clamped).abs() > 0.0001 {
                     note.energy = clamped;
                     updated += 1;
                 }
@@ -6230,10 +6236,13 @@ impl GraphStore for MockGraphStore {
     async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<bool> {
         let mut notes = self.notes.write().await;
         if let Some(note) = notes.get_mut(&note_id) {
-            // Lazy decay: compute current energy before adding boost
+            // Add to the current decayed energy, then re-anchor the base.
             let current_e = note.computed_energy();
-            note.energy = (current_e + amount).min(1.0);
+            let new_e = (current_e + amount).min(1.0);
+            note.energy = new_e;
+            note.energy_base = new_e;
             note.last_activated = Some(chrono::Utc::now());
+            note.activation_count += 1;
             Ok(true)
         } else {
             Ok(false)
@@ -6392,9 +6401,27 @@ impl GraphStore for MockGraphStore {
             .map(|n| n.id)
             .collect();
 
+        // Mirror the production path (Neo4jNoteStore::consolidate_memory):
+        // when a note carries no stored activation_count, fall back to its
+        // synaptic degree. The mock used to read `note.activation_count`
+        // alone, so the archival rule it exercised was not the one running in
+        // production — which is exactly how a green CI coexisted with 497
+        // wrongly archived notes.
+        let synapse_degree: HashMap<Uuid, i64> = {
+            let synapses = self.note_synapses.read().await;
+            synapses
+                .iter()
+                .map(|(id, neighbors)| (*id, neighbors.len() as i64))
+                .collect()
+        };
+
         for id in ids {
             if let Some(note) = notes.get(&id).cloned() {
-                let activation_count = note.activation_count;
+                let activation_count = if note.activation_count > 0 {
+                    note.activation_count
+                } else {
+                    synapse_degree.get(&id).copied().unwrap_or(0)
+                };
 
                 // Check auto-archival (threshold-based rules)
                 if lifecycle.should_auto_archive(&note, activation_count, now) {
@@ -15225,5 +15252,185 @@ mod tests {
         let remaining = store.project_files.read().await;
         assert_eq!(remaining.get(&project).unwrap(), &vec![real.clone()]);
         assert_eq!(remaining.get(&other).unwrap(), &vec![elsewhere.clone()]);
+    }
+}
+
+#[cfg(test)]
+mod energy_decay_tests {
+    use super::*;
+    use crate::neo4j::traits::GraphStore;
+    use crate::notes::energy::ENERGY_HALF_LIFE_DAYS;
+
+    /// The decay job must be a function of elapsed idle time, not of how many
+    /// times it ran.
+    ///
+    /// Before the 2026-09 fix the job multiplied the stored `energy` by
+    /// `exp(-days_idle / half_life)` on every pass without ever moving
+    /// `last_activated`, so 120 passes over 30 days applied the 30-day decay
+    /// 120 times: `exp(-30/14)^120 ≈ 0`. The heartbeat fires 4×/day, which is
+    /// exactly how 93 % of active notes ended up at energy 0.0.
+    #[tokio::test]
+    async fn update_energy_scores_is_temporally_idempotent() {
+        let store = MockGraphStore::new();
+
+        let mut note = Note::new(
+            Some(Uuid::new_v4()),
+            crate::notes::NoteType::Guideline,
+            "## Mandatory Warm-Up".to_string(),
+            "test".to_string(),
+        );
+        note.energy = 1.0;
+        note.energy_base = 1.0;
+        note.last_activated = Some(chrono::Utc::now() - chrono::Duration::days(30));
+        store.create_note(&note).await.unwrap();
+
+        // 30 days at 4 heartbeats/day.
+        for _ in 0..120 {
+            store
+                .update_energy_scores(ENERGY_HALF_LIFE_DAYS)
+                .await
+                .unwrap();
+        }
+
+        let stored = store.get_note(note.id).await.unwrap().unwrap();
+        let expected = (-30.0f64 / ENERGY_HALF_LIFE_DAYS).exp();
+        assert!(
+            (stored.energy - expected).abs() < 1e-6,
+            "after 120 passes over 30 idle days energy is {}, expected {} \
+             (a cumulative job collapses it to ~0)",
+            stored.energy,
+            expected
+        );
+    }
+
+    /// Reading a note must lift it clear of the clamp floor and keep it there.
+    ///
+    /// The boost (0.05), the clamp floor (< 0.05 → 0.0) and the archive
+    /// threshold (< 0.05) used to be the same literal, so a revived note
+    /// landed exactly *on* the threshold and was flushed back to zero on the
+    /// next pass.
+    #[tokio::test]
+    async fn a_read_note_survives_the_next_decay_pass() {
+        let store = MockGraphStore::new();
+
+        let mut note = Note::new(
+            Some(Uuid::new_v4()),
+            crate::notes::NoteType::Guideline,
+            "## Safe Modification Workflow".to_string(),
+            "test".to_string(),
+        );
+        note.energy = 0.0;
+        note.energy_base = 0.0;
+        note.last_activated = Some(chrono::Utc::now() - chrono::Duration::days(200));
+        store.create_note(&note).await.unwrap();
+
+        store
+            .boost_energy(note.id, crate::notes::energy::CONTEXT_ENERGY_BOOST)
+            .await
+            .unwrap();
+
+        // A week of heartbeats later it must still be comfortably alive.
+        for _ in 0..28 {
+            store
+                .update_energy_scores(ENERGY_HALF_LIFE_DAYS)
+                .await
+                .unwrap();
+        }
+
+        let stored = store.get_note(note.id).await.unwrap().unwrap();
+        assert!(
+            stored.energy > crate::notes::energy::ENERGY_CLAMP_FLOOR,
+            "a note that was just read fell back to {} — reanimation is \
+             still impossible",
+            stored.energy
+        );
+    }
+}
+
+#[cfg(test)]
+mod consolidation_tests {
+    use super::*;
+    use crate::neo4j::traits::GraphStore;
+    use crate::notes::{NoteImportance, NoteStatus, NoteType};
+
+    fn aged_note(content: &str, importance: NoteImportance, age_days: i64) -> Note {
+        let mut note = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Guideline,
+            content.to_string(),
+            "test".to_string(),
+        );
+        note.importance = importance;
+        note.created_at = chrono::Utc::now() - chrono::Duration::days(age_days);
+        note.last_activated = Some(chrono::Utc::now() - chrono::Duration::days(age_days));
+        note.energy = 0.0;
+        note.energy_base = 0.0;
+        note.memory_horizon = crate::notes::MemoryHorizon::Consolidated;
+        note.activation_count = 3;
+        note
+    }
+
+    /// The foundation-kit regression, end to end through the store.
+    ///
+    /// "## Mandatory Warm-Up" is a *critical* guideline and it was archived in
+    /// all 9 projects with reason `low_energy_60d`. Restore the old rule —
+    /// `energy < 0.05 && age > 60` with no importance test — and this fails.
+    #[tokio::test]
+    async fn consolidate_memory_spares_critical_notes_and_still_retires_medium_ones() {
+        let store = MockGraphStore::new();
+
+        let critical = aged_note("## Mandatory Warm-Up", NoteImportance::Critical, 65);
+        let high = aged_note("## Safe Modification Workflow", NoteImportance::High, 65);
+        let medium = aged_note("a passing remark", NoteImportance::Medium, 65);
+
+        store.create_note(&critical).await.unwrap();
+        store.create_note(&high).await.unwrap();
+        store.create_note(&medium).await.unwrap();
+
+        let (_promoted, archived) = store.consolidate_memory().await.unwrap();
+
+        assert_eq!(
+            store.get_note(critical.id).await.unwrap().unwrap().status,
+            NoteStatus::Active,
+            "a critical guideline was auto-archived"
+        );
+        assert_eq!(
+            store.get_note(high.id).await.unwrap().unwrap().status,
+            NoteStatus::Active,
+            "a high-importance guideline was auto-archived"
+        );
+        assert_eq!(
+            store.get_note(medium.id).await.unwrap().unwrap().status,
+            NoteStatus::Archived,
+            "the low-energy rule must still retire ordinary notes"
+        );
+        assert_eq!(archived, 1);
+    }
+
+    /// Reading a note is what keeps it alive, so reading it must be counted.
+    /// `Note.activation_count` was written once at creation and never
+    /// incremented again — every consumer of it read a structural zero.
+    #[tokio::test]
+    async fn boost_energy_counts_the_activation() {
+        let store = MockGraphStore::new();
+        let note = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Guideline,
+            "counted".to_string(),
+            "test".to_string(),
+        );
+        store.create_note(&note).await.unwrap();
+
+        store
+            .boost_energy(note.id, crate::notes::energy::CONTEXT_ENERGY_BOOST)
+            .await
+            .unwrap();
+        store
+            .boost_energy(note.id, crate::notes::energy::CONTEXT_ENERGY_BOOST)
+            .await
+            .unwrap();
+
+        let stored = store.get_note(note.id).await.unwrap().unwrap();
+        assert_eq!(stored.activation_count, 2);
     }
 }

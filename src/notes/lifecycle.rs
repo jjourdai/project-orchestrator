@@ -832,8 +832,24 @@ impl NoteLifecycleManager {
     /// Check if a note should be auto-archived based on usage thresholds.
     ///
     /// Rules (pure arithmetic, 0 LLM calls):
+    /// - `importance ∈ {critical, high}` -> never auto-archived
     /// - `activation_count == 0 AND age > 90 days` -> archive (dead note)
-    /// - `energy < 0.05 AND age > 60 days` -> archive (low-energy note)
+    /// - `energy < ARCHIVE_ENERGY_THRESHOLD AND age > 60 days` -> archive
+    ///
+    /// Two things this function used to get wrong, together worth 497 archived
+    /// notes and the loss of the foundation-kit in all 9 projects:
+    ///
+    /// 1. It ignored `importance` entirely, while `evaluate_promotion` right
+    ///    above it does take `Critical` into account. A critical guideline
+    ///    fell exactly like a low-importance observation.
+    /// 2. Its threshold was the literal `0.05` — the *same* value as the
+    ///    energy clamp floor and as the activation boost. A note read from a
+    ///    chat prompt came back to exactly 0.05, i.e. precisely on the
+    ///    archival threshold. See [`crate::notes::energy`].
+    ///
+    /// It also read the stored `energy` cache while `evaluate_promotion` read
+    /// `computed_energy()`; both now read `computed_energy()`, so promotion
+    /// and archival can no longer disagree about the same note.
     pub fn should_auto_archive(
         &self,
         note: &Note,
@@ -843,6 +859,16 @@ impl NoteLifecycleManager {
         if note.status != NoteStatus::Active {
             return false;
         }
+
+        // Important knowledge is never retired by arithmetic alone. Archiving
+        // it is a human decision, or an explicit supersede.
+        if matches!(
+            note.importance,
+            NoteImportance::Critical | NoteImportance::High
+        ) {
+            return false;
+        }
+
         let age_days = now.signed_duration_since(note.created_at).num_days();
 
         // Dead note: never activated and older than 90 days
@@ -851,7 +877,7 @@ impl NoteLifecycleManager {
         }
 
         // Low-energy note: energy depleted and older than 60 days
-        if note.energy < 0.05 && age_days > 60 {
+        if note.computed_energy() < crate::notes::energy::ARCHIVE_ENERGY_THRESHOLD && age_days > 60 {
             return true;
         }
 
@@ -1114,11 +1140,85 @@ mod tests {
             "test".to_string(),
         );
         note.created_at = Utc::now() - chrono::Duration::days(70);
-        note.energy = 0.02;
+        note.importance = NoteImportance::Medium;
+        note.energy = 0.0;
+        note.energy_base = 0.0;
+        note.last_activated = Some(Utc::now() - chrono::Duration::days(70));
         note.activation_count = 3;
         note.status = NoteStatus::Active;
 
         assert!(manager.should_auto_archive(&note, 3, Utc::now()));
+    }
+
+    /// The foundation-kit regression: "## Mandatory Warm-Up" was a *critical*
+    /// guideline and it was archived in all 9 projects, because
+    /// `should_auto_archive` never looked at `importance` — while
+    /// `evaluate_promotion`, twenty lines above, always did.
+    #[test]
+    fn test_critical_note_is_never_auto_archived() {
+        let manager = NoteLifecycleManager::new();
+        let mut note = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Guideline,
+            "## Mandatory Warm-Up".to_string(),
+            "test".to_string(),
+        );
+        note.importance = NoteImportance::Critical;
+        note.created_at = Utc::now() - chrono::Duration::days(200);
+        note.last_activated = Some(Utc::now() - chrono::Duration::days(200));
+        note.energy = 0.0;
+        note.energy_base = 0.0;
+        note.activation_count = 0;
+        note.status = NoteStatus::Active;
+
+        assert!(
+            !manager.should_auto_archive(&note, 0, Utc::now()),
+            "a critical note, 200 days old at zero energy, must stay active"
+        );
+
+        // High importance is protected too.
+        note.importance = NoteImportance::High;
+        assert!(!manager.should_auto_archive(&note, 0, Utc::now()));
+
+        // Medium is not — the rule still does its job.
+        note.importance = NoteImportance::Medium;
+        assert!(manager.should_auto_archive(&note, 0, Utc::now()));
+    }
+
+    /// A note that is read once a week must never reach the archive
+    /// threshold. Before the fix the boost (0.05), the clamp floor (0.05) and
+    /// this threshold (0.05) were the same number, so a revived note landed
+    /// exactly on the threshold and was archived the next day.
+    #[test]
+    fn test_weekly_activation_keeps_a_note_out_of_the_archive() {
+        use crate::notes::energy::{decayed_energy, CONTEXT_ENERGY_BOOST, ENERGY_HALF_LIFE_DAYS};
+
+        let manager = NoteLifecycleManager::new();
+        let mut note = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Guideline,
+            "read every week".to_string(),
+            "test".to_string(),
+        );
+        note.importance = NoteImportance::Medium;
+        note.created_at = Utc::now() - chrono::Duration::days(90);
+        note.activation_count = 13;
+        note.status = NoteStatus::Active;
+
+        // 90 days, one read per week, sampled the day before each read.
+        let mut base = CONTEXT_ENERGY_BOOST;
+        for week in 0..13 {
+            note.energy_base = base;
+            note.last_activated = Some(Utc::now() - chrono::Duration::days(6));
+            note.energy = decayed_energy(base, 6.0, ENERGY_HALF_LIFE_DAYS);
+            assert!(
+                !manager.should_auto_archive(&note, 13, Utc::now()),
+                "archived at week {week} with energy {}",
+                note.energy
+            );
+            base = (decayed_energy(base, 7.0, ENERGY_HALF_LIFE_DAYS) + CONTEXT_ENERGY_BOOST)
+                .min(1.0);
+        }
     }
 
     #[test]

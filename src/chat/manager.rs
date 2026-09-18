@@ -1786,7 +1786,7 @@ impl ChatManager {
             }
             if !note_ids.is_empty() {
                 let graph = self.graph.clone();
-                let boost = 0.05; // context_energy_boost
+                let boost = crate::notes::energy::CONTEXT_ENERGY_BOOST;
                 tokio::spawn(async move {
                     for id in &note_ids {
                         if let Err(e) = graph.boost_energy(*id, boost).await {

@@ -145,7 +145,7 @@ impl Default for AutoReinforcementConfig {
             search_synapse_boost: 0.03,
             commit_energy_boost: 0.15,
             commit_synapse_boost: 0.03,
-            context_energy_boost: 0.05,
+            context_energy_boost: crate::notes::energy::CONTEXT_ENERGY_BOOST,
             chat_energy_boost: 0.05,
             chat_synapse_boost: 0.02,
             hook_energy_boost: 0.1,
@@ -180,7 +180,10 @@ mod tests {
         assert!((config.search_synapse_boost - 0.03).abs() < f64::EPSILON);
         assert!((config.commit_energy_boost - 0.15).abs() < f64::EPSILON);
         assert!((config.commit_synapse_boost - 0.03).abs() < f64::EPSILON);
-        assert!((config.context_energy_boost - 0.05).abs() < f64::EPSILON);
+        // Must stay clear of the energy clamp floor — when boost, floor and
+        // archive threshold were all 0.05, a note read from a prompt landed
+        // exactly on the archival threshold and died the next day.
+        assert!(config.context_energy_boost > crate::notes::energy::ENERGY_CLAMP_FLOOR * 5.0);
         assert!((config.chat_energy_boost - 0.05).abs() < f64::EPSILON);
         assert!((config.chat_synapse_boost - 0.02).abs() < f64::EPSILON);
         assert!((config.hook_energy_boost - 0.1).abs() < f64::EPSILON);

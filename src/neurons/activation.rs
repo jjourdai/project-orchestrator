@@ -675,6 +675,9 @@ mod tests {
         );
         note.id = id;
         note.energy = energy;
+        // Keep the base in sync: energy is a cache of energy_base, and any
+        // reader going through computed_energy() reads the base.
+        note.energy_base = energy;
         note.importance = NoteImportance::High;
         note
     }

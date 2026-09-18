@@ -556,6 +556,7 @@ async fn trace_evolution_note(graph_store: &dyn GraphStore, project_id: Uuid, co
         last_confirmed_by: None,
         staleness_score: 0.0,
         energy: 0.5, // Moderate initial energy — not critical knowledge
+        energy_base: 0.5,
         last_activated: Some(Utc::now()),
         reactivation_count: 0,
         last_reactivated: None,
@@ -1605,6 +1606,7 @@ mod tests {
             last_confirmed_by: None,
             staleness_score: 0.0,
             energy: 0.5,
+            energy_base: 0.5,
             last_activated: None,
             reactivation_count: 0,
             last_reactivated: None,
