@@ -141,7 +141,24 @@ pub async fn anonymize_episode(
             .await
             .map_err(AppError::Internal)?;
 
-    let portable_episode = episode.map(|ep| ep.to_portable());
+    // to_portable() is a field-for-field clone — it renames the type but scrubs
+    // nothing. The anonymization pipeline must actually run, and must be able to
+    // BLOCK the export when it finds L3 content (keys, passwords, private keys).
+    let portable_episode = match episode {
+        Some(ep) => {
+            let (clean, report) = crate::episodes::anonymize::anonymize_portable_episode(
+                &ep.to_portable(),
+            )
+            .map_err(|e| AppError::Forbidden(e.to_string()))?;
+            tracing::debug!(
+                redacted = report.redacted_count,
+                patterns = ?report.patterns_applied,
+                "Episode anonymized"
+            );
+            Some(clean)
+        }
+        None => None,
+    };
 
     Ok(Json(AnonymizeEpisodeResponse { portable_episode }))
 }
@@ -231,8 +248,16 @@ pub async fn export_artifact(
         .await
         .map_err(AppError::Internal)?;
 
-    let portable_episodes: Vec<crate::episodes::PortableEpisode> =
-        episodes.iter().map(|ep| ep.to_portable()).collect();
+    // Same as the single-episode path: run the pipeline for real. A single
+    // L3 hit blocks the whole artifact rather than shipping it partially clean.
+    let mut portable_episodes: Vec<crate::episodes::PortableEpisode> =
+        Vec::with_capacity(episodes.len());
+    for ep in &episodes {
+        let (clean, _report) =
+            crate::episodes::anonymize::anonymize_portable_episode(&ep.to_portable())
+                .map_err(|e| AppError::Forbidden(e.to_string()))?;
+        portable_episodes.push(clean);
+    }
 
     // 3. Collect structural edges if requested
     let mut structure = Vec::new();
@@ -240,9 +265,15 @@ pub async fn export_artifact(
         // Co-change edges (files that change together)
         if let Ok(co_changes) = neo4j.get_co_change_graph(body.project_id, 2, 100).await {
             for pair in co_changes {
+                // These are absolute filesystem paths; scrubbing the episode
+                // bodies while shipping raw paths on the edges would defeat it.
+                let source = crate::episodes::anonymize::anonymize_fragment(&pair.file_a)
+                    .map_err(|e| AppError::Forbidden(e.to_string()))?;
+                let target = crate::episodes::anonymize::anonymize_fragment(&pair.file_b)
+                    .map_err(|e| AppError::Forbidden(e.to_string()))?;
                 structure.push(ArtifactEdge {
-                    source: pair.file_a,
-                    target: pair.file_b,
+                    source,
+                    target,
                     relation: "CO_CHANGED".to_string(),
                     weight: pair.count as f64,
                 });

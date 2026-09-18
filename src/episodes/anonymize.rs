@@ -56,6 +56,8 @@ pub enum AnonymizeError {
     L3Blocked(L3BlockedError),
     /// Sharing is disabled for the project.
     SharingDisabled,
+    /// The episode could not be serialised/deserialised around the pipeline.
+    Serialization(String),
 }
 
 impl std::fmt::Display for AnonymizeError {
@@ -64,6 +66,9 @@ impl std::fmt::Display for AnonymizeError {
             AnonymizeError::L3Blocked(e) => write!(f, "{}", e),
             AnonymizeError::SharingDisabled => {
                 write!(f, "Sharing is disabled for this project. Export blocked.")
+            }
+            AnonymizeError::Serialization(e) => {
+                write!(f, "Failed to serialize episode for anonymization: {}", e)
             }
         }
     }
@@ -136,7 +141,12 @@ static RE_H11_CORP_DOMAIN: LazyLock<Regex> =
 
 /// H12: UUIDs (8-4-4-4-12 hex).
 static RE_H12_UUID: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+    // No \b anchors: the leading one fails whenever the UUID is glued to a word
+    // character, which is exactly the shape the orchestrator emits itself
+    // ("hierarchy:parent_<uuid>"), letting raw UUIDs through. The 8-4-4-4-12
+    // pattern is specific enough on its own, and over-redacting is the safe
+    // direction here.
+    Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
         .unwrap()
 });
 
@@ -799,6 +809,86 @@ pub fn anonymize_for_export<'a>(
     Ok((anonymized, pipeline_report, allowed_notes))
 }
 
+/// Anonymize a whole [`PortableEpisode`] by running every text field through
+/// the default pipeline.
+///
+/// The episode is serialised, passed through the pipeline as one document, and
+/// deserialised back. Doing it on the serialised form (rather than field by
+/// field) means a field added later is covered automatically instead of
+/// silently shipping raw — which is exactly how the handlers came to return
+/// unanonymized data in the first place.
+///
+/// Returns `Err(L3BlockedError)` when the content carries secrets that must
+/// block the export outright (API keys, passwords, private keys).
+pub fn anonymize_portable_episode(
+    episode: &crate::episodes::PortableEpisode,
+) -> Result<(crate::episodes::PortableEpisode, AnonymizationReport), AnonymizeError> {
+    let value = serde_json::to_value(episode)
+        .map_err(|e| AnonymizeError::Serialization(e.to_string()))?;
+
+    let pipeline = AnonymizationPipeline::default_pipeline();
+    let mut report = AnonymizationReport {
+        redacted_count: 0,
+        patterns_applied: Vec::new(),
+        blocked_l3: false,
+        consent_stats: None,
+    };
+    let cleaned = anonymize_json_value(&value, &pipeline, &mut report)?;
+
+    let episode = serde_json::from_value(cleaned)
+        .map_err(|e| AnonymizeError::Serialization(e.to_string()))?;
+    Ok((episode, report))
+}
+
+/// Walk a JSON tree and run every STRING VALUE through the pipeline.
+///
+/// Anonymizing the serialised document as one blob corrupts it — the
+/// placeholders and escaping do not survive re-parsing. Walking the tree keeps
+/// the structure byte-exact and only rewrites leaf values, while still covering
+/// every field, including ones added later.
+fn anonymize_json_value(
+    value: &serde_json::Value,
+    pipeline: &AnonymizationPipeline,
+    report: &mut AnonymizationReport,
+) -> Result<serde_json::Value, AnonymizeError> {
+    use serde_json::Value;
+    Ok(match value {
+        Value::String(s) => {
+            let (clean, sub) = pipeline.run(s)?;
+            report.redacted_count += sub.redacted_count;
+            for p in sub.patterns_applied {
+                if !report.patterns_applied.contains(&p) {
+                    report.patterns_applied.push(p);
+                }
+            }
+            Value::String(clean)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|v| anonymize_json_value(v, pipeline, report))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                // Keys are field names, never user data — leave them alone.
+                out.insert(k.clone(), anonymize_json_value(v, pipeline, report)?);
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    })
+}
+
+/// Anonymize a free-standing string (e.g. a file path carried on an artifact
+/// edge) with the same pipeline, so structural data cannot leak paths that the
+/// episode bodies had scrubbed.
+pub fn anonymize_fragment(value: &str) -> Result<String, AnonymizeError> {
+    let (clean, _) = anonymize(value)?;
+    Ok(clean)
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -1254,5 +1344,89 @@ mod tests {
         assert!(result.contains("<ip:0>"));
         assert!(report.consent_stats.is_some());
         assert!(allowed.is_empty()); // no notes provided
+    }
+}
+
+#[cfg(test)]
+mod export_leak_tests {
+    use super::*;
+    use crate::episodes::PortableEpisode;
+
+    /// Build a minimal portable episode via serde so the test does not have to
+    /// track every field of the four sub-structs.
+    fn episode_with(state_name: &str, trigger: &str, request: &str) -> PortableEpisode {
+        let v = serde_json::json!({
+            "stimulus": { "request": request, "trigger": "manual" },
+            "process": {
+                "had_reasoning_tree": false,
+                "states_visited": [state_name, trigger],
+                "relative_duration": 1.0
+            },
+            "outcome": {
+                "notes_produced": 0,
+                "decisions_made": 0,
+                "commits_made": 0,
+                "files_modified": 0
+            },
+            "validation": { "feedback_type": "implicit_positive" }
+        });
+        serde_json::from_value(v).expect("fixture must deserialize")
+    }
+
+    /// Verbatim reproduction of the audit leak: an api_key planted in a state
+    /// name came straight back out of the "anonymized" episode.
+    #[test]
+    fn api_key_blocks_the_export() {
+        let ep = episode_with(
+            "api_key=sk-ABCD1234efgh5678IJKLmnop",
+            "go",
+            "do the thing",
+        );
+        let err = anonymize_portable_episode(&ep).unwrap_err();
+        assert!(
+            matches!(err, AnonymizeError::L3Blocked(_)),
+            "a secret must BLOCK the export, got {err:?}"
+        );
+    }
+
+    /// Absolute paths must not survive: the handler doc promises
+    /// "no UUIDs, no absolute paths".
+    #[test]
+    fn absolute_paths_do_not_survive() {
+        let ep = episode_with(
+            "read /Users/someone/repositories/secret-project/src/models.py",
+            "done",
+            "read the model",
+        );
+        let (clean, _report) = anonymize_portable_episode(&ep).unwrap();
+        let json = serde_json::to_string(&clean).unwrap();
+        assert!(
+            !json.contains("/Users/someone/repositories/secret-project"),
+            "absolute path leaked: {json}"
+        );
+    }
+
+    /// A raw UUID in the stimulus (hierarchy:parent_<uuid>) must be scrubbed.
+    #[test]
+    fn raw_uuids_do_not_survive() {
+        let ep = episode_with(
+            "work",
+            "done",
+            "hierarchy:parent_2326f8a4-a481-44ed-b4c9-9c2686d54c34",
+        );
+        let (clean, _report) = anonymize_portable_episode(&ep).unwrap();
+        let json = serde_json::to_string(&clean).unwrap();
+        assert!(
+            !json.contains("2326f8a4-a481-44ed-b4c9-9c2686d54c34"),
+            "raw uuid leaked: {json}"
+        );
+    }
+
+    /// The round-trip must preserve structure for benign content.
+    #[test]
+    fn benign_episode_round_trips() {
+        let ep = episode_with("analyze", "next", "refactor the parser");
+        let (clean, _) = anonymize_portable_episode(&ep).unwrap();
+        assert_eq!(clean.process.states_visited.len(), 2);
     }
 }
