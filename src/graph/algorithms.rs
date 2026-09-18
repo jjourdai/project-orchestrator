@@ -1194,13 +1194,18 @@ pub fn structural_dna(
             .filter(|d| *d < f64::MAX)
             .fold(0.0f64, f64::max);
 
-        if max_dist > 0.0 {
-            for dna in dna_map.values_mut() {
-                if dna[dim] < f64::MAX {
-                    dna[dim] /= max_dist;
-                } else {
-                    dna[dim] = 1.0; // unreachable nodes get max distance
-                }
+        // Neutralise the unreachable sentinel UNCONDITIONALLY. Doing it only
+        // inside `max_dist > 0.0` left f64::MAX in the vector whenever an anchor
+        // reached nothing but itself (isolated component, or every reachable
+        // distance zero). The sentinel then survived into the persisted DNA and
+        // poisoned everything downstream: averaging it overflows to inf, which
+        // serde renders as JSON null, so cluster_dna returned centroids
+        // containing null and silently dropped its cohesion field.
+        for dna in dna_map.values_mut() {
+            if dna[dim] >= f64::MAX {
+                dna[dim] = 1.0; // unreachable nodes sit at max normalised distance
+            } else if max_dist > 0.0 {
+                dna[dim] /= max_dist;
             }
         }
     }
@@ -5112,6 +5117,47 @@ mod tests {
         let pr = HashMap::new();
         let dna = structural_dna(&g, &pr, 5).unwrap();
         assert!(dna.is_empty());
+    }
+
+    /// Regression: an anchor that reaches nothing but itself makes max_dist 0,
+    /// and the sentinel neutralisation used to sit INSIDE `if max_dist > 0.0`,
+    /// so f64::MAX survived into the persisted vector. Downstream, averaging it
+    /// overflows to inf, serde renders that as JSON null, and cluster_dna
+    /// returned centroids containing null while silently dropping cohesion.
+    #[test]
+    fn test_structural_dna_disconnected_nodes_have_no_sentinel() {
+        use crate::graph::models::{CodeNode, CodeNodeType};
+
+        // Three mutually unreachable nodes: every anchor sees only itself.
+        let mut g = CodeGraph::new();
+        for i in 0..3 {
+            g.add_node(CodeNode {
+                id: format!("iso_{i}"),
+                node_type: CodeNodeType::File,
+                path: Some(format!("src/iso_{i}.rs")),
+                name: format!("iso_{i}"),
+                project_id: None,
+            });
+        }
+        let pr: HashMap<String, f64> = (0..3)
+            .map(|i| (format!("iso_{i}"), 1.0 / (i as f64 + 1.0)))
+            .collect();
+
+        let dna = structural_dna(&g, &pr, 3).unwrap();
+        assert_eq!(dna.len(), 3);
+
+        for (id, v) in &dna {
+            for &d in v {
+                assert!(d.is_finite(), "non-finite DNA value for {id}: {d}");
+                assert!(
+                    (0.0..=1.0).contains(&d),
+                    "DNA value out of range for {id}: {d}"
+                );
+            }
+            // The mean must stay finite — this is what cluster_dna averages.
+            let mean: f64 = v.iter().sum::<f64>() / v.len() as f64;
+            assert!(mean.is_finite(), "centroid would be null for {id}");
+        }
     }
 
     #[test]

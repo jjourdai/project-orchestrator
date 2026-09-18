@@ -1231,6 +1231,27 @@ impl Neo4jClient {
 
         const CHUNK_SIZE: usize = 1000;
 
+        // Refuse to persist a non-finite vector. A sentinel or an overflow that
+        // reaches the graph is invisible at write time and only surfaces much
+        // later as a null centroid or a silently missing cohesion score.
+        let updates: Vec<_> = updates
+            .iter()
+            .filter(|u| {
+                let ok = u.dna.iter().all(|v| v.is_finite());
+                if !ok {
+                    tracing::warn!(
+                        path = %u.path,
+                        "Refusing to persist non-finite structural DNA"
+                    );
+                }
+                ok
+            })
+            .cloned()
+            .collect();
+        if updates.is_empty() {
+            return Ok(());
+        }
+
         for chunk in updates.chunks(CHUNK_SIZE) {
             let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = chunk
                 .iter()
