@@ -735,9 +735,17 @@ impl Neo4jClient {
         let files = {
             let q = query(
                 r#"
-                MATCH (p:Persona {id: $pid})-[r:KNOWS]->(f:File)
-                RETURN f.path AS entity_id, r.weight AS weight
-                ORDER BY r.weight DESC
+                // [:EXTENDS*0..3] walks the persona ITSELF (zero hops) and its
+                // ancestors, so inherited knowledge is included. add_extends wrote
+                // this relation and nothing ever read it, so a child persona's
+                // subgraph came back empty and activate rendered an empty context —
+                // while the docs promise "child inherits parent's KNOWS".
+                // max(weight) keeps the strongest claim when a persona and an
+                // ancestor both know the same entity.
+                MATCH (p:Persona {id: $pid})-[:EXTENDS*0..3]->(anc:Persona)-[r:KNOWS]->(f:File)
+                WITH f.path AS entity_id, max(r.weight) AS weight
+                RETURN entity_id, weight
+                ORDER BY weight DESC
                 "#,
             )
             .param("pid", pid.clone());
@@ -748,9 +756,17 @@ impl Neo4jClient {
         let functions = {
             let q = query(
                 r#"
-                MATCH (p:Persona {id: $pid})-[r:KNOWS]->(fn:Function)
-                RETURN fn.id AS entity_id, r.weight AS weight
-                ORDER BY r.weight DESC
+                // [:EXTENDS*0..3] walks the persona ITSELF (zero hops) and its
+                // ancestors, so inherited knowledge is included. add_extends wrote
+                // this relation and nothing ever read it, so a child persona's
+                // subgraph came back empty and activate rendered an empty context —
+                // while the docs promise "child inherits parent's KNOWS".
+                // max(weight) keeps the strongest claim when a persona and an
+                // ancestor both know the same entity.
+                MATCH (p:Persona {id: $pid})-[:EXTENDS*0..3]->(anc:Persona)-[r:KNOWS]->(fn:Function)
+                WITH fn.id AS entity_id, max(r.weight) AS weight
+                RETURN entity_id, weight
+                ORDER BY weight DESC
                 "#,
             )
             .param("pid", pid.clone());
@@ -761,9 +777,17 @@ impl Neo4jClient {
         let notes = {
             let q = query(
                 r#"
-                MATCH (p:Persona {id: $pid})-[r:USES]->(n:Note)
-                RETURN n.id AS entity_id, r.weight AS weight
-                ORDER BY r.weight DESC
+                // [:EXTENDS*0..3] walks the persona ITSELF (zero hops) and its
+                // ancestors, so inherited knowledge is included. add_extends wrote
+                // this relation and nothing ever read it, so a child persona's
+                // subgraph came back empty and activate rendered an empty context —
+                // while the docs promise "child inherits parent's KNOWS".
+                // max(weight) keeps the strongest claim when a persona and an
+                // ancestor both know the same entity.
+                MATCH (p:Persona {id: $pid})-[:EXTENDS*0..3]->(anc:Persona)-[r:USES]->(n:Note)
+                WITH n.id AS entity_id, max(r.weight) AS weight
+                RETURN entity_id, weight
+                ORDER BY weight DESC
                 "#,
             )
             .param("pid", pid.clone());
@@ -774,9 +798,17 @@ impl Neo4jClient {
         let decisions = {
             let q = query(
                 r#"
-                MATCH (p:Persona {id: $pid})-[r:USES]->(d:Decision)
-                RETURN d.id AS entity_id, r.weight AS weight
-                ORDER BY r.weight DESC
+                // [:EXTENDS*0..3] walks the persona ITSELF (zero hops) and its
+                // ancestors, so inherited knowledge is included. add_extends wrote
+                // this relation and nothing ever read it, so a child persona's
+                // subgraph came back empty and activate rendered an empty context —
+                // while the docs promise "child inherits parent's KNOWS".
+                // max(weight) keeps the strongest claim when a persona and an
+                // ancestor both know the same entity.
+                MATCH (p:Persona {id: $pid})-[:EXTENDS*0..3]->(anc:Persona)-[r:USES]->(d:Decision)
+                WITH d.id AS entity_id, max(r.weight) AS weight
+                RETURN entity_id, weight
+                ORDER BY weight DESC
                 "#,
             )
             .param("pid", pid.clone());

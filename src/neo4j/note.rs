@@ -381,8 +381,14 @@ impl Neo4jClient {
             format!(
                 r#"
                 MATCH (n:Note {{id: $note_id}})
-                MATCH (e:{})
-                WHERE e.{} ENDS WITH $entity_id
+                MATCH (e:{0})
+                // Require a full path SEGMENT match, not a bare suffix.
+                // `ENDS WITH 'service.py'` also matches `myservice.py`, and the
+                // query is unbounded across projects, so one call could link a
+                // note to every same-suffixed file in the instance. The extra
+                // '/' anchor is the same guard find_personas_for_file uses.
+                WHERE e.{1} ENDS WITH $entity_id
+                  AND e.{1} ENDS WITH ('/' + $entity_id)
                 MERGE (n)-[r:LINKED_TO]->(e)
                 SET r.signature_hash = $sig_hash,
                     r.body_hash = $body_hash,
@@ -621,6 +627,19 @@ impl Neo4jClient {
                 YIELD node AS n, score
                 WHERE score > $min_similarity
                   AND n.status IN ['active', 'needs_review']
+                  // Scope to this project, plus global (project-less) notes,
+                  // which are cross-project conventions and SHOULD propagate.
+                  //
+                  // Without this the vector search ranked notes from every
+                  // project in the instance, so a file received "propagated
+                  // knowledge" about an unrelated product: a 3-file sandbox
+                  // task was handed 8 KB of gotchas from another codebase's
+                  // ingestion pipeline, presented as relevant to it. Its
+                  // sibling semantic_anchor_note has always filtered on
+                  // project_id; this one never did.
+                  AND (n.project_id = $project_id
+                       OR n.project_id IS NULL
+                       OR n.project_id = '')
                 WITH n, score
                 MATCH (f:File {path: $file_path})
                 WHERE NOT (n)-[:LINKED_TO]->(f)
@@ -636,7 +655,8 @@ impl Neo4jClient {
             .param("k", 5i64)
             .param("embedding", emb_f32)
             .param("min_similarity", min_similarity)
-            .param("file_path", file_path.clone());
+            .param("file_path", file_path.clone())
+            .param("project_id", project_id.to_string());
 
             if let Ok(mut result) = self.graph.execute(search_q).await {
                 if let Ok(Some(row)) = result.next().await {
