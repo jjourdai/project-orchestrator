@@ -1004,6 +1004,20 @@ impl AppState {
             .await?,
         );
         let nr_store = Arc::new(neural_routing_runtime::Neo4jTrajectoryStore::new(nr_graph));
+        // Create the trajectory indexes, including the two HNSW vector indexes that
+        // search_similar() queries by name. Without this call the indexes never exist
+        // and EVERY nn-mode inference fails at runtime, silently degrading to the
+        // fallback while `neural_routing status` reports a plausible-looking
+        // hit_rate of 0.0. Failure is logged loudly rather than fatal: routing has a
+        // fallback path, but a missing index must not look like "no matches yet".
+        if let Err(e) = nr_store.ensure_indexes().await {
+            tracing::error!(
+                error = %e,
+                "Failed to create neural-routing indexes — nn-mode inference will \
+                 fail on every query and silently fall back. Check Neo4j version \
+                 (vector indexes need 5.13+)."
+            );
+        }
         let trajectory_store: Arc<dyn neural_routing_runtime::TrajectoryStore> = nr_store.clone();
         let trajectory_store_api: Arc<dyn neural_routing_runtime::TrajectoryStore> =
             nr_store.clone();
