@@ -1060,9 +1060,33 @@ pub async fn import_persona(
         .await
         .map_err(AppError::Internal)?;
 
-    let existing_match = existing
+    // Reject an unrecognised strategy instead of silently treating it as
+    // "merge" — that default is what turned a typo into a duplicate persona.
+    if !matches!(conflict_strategy, "skip" | "merge" | "replace") {
+        return Err(AppError::BadRequest(format!(
+            "Unknown conflict_strategy '{}'. Expected one of: skip, merge, replace",
+            conflict_strategy
+        )));
+    }
+
+    let same_name: Vec<_> = existing
         .iter()
-        .find(|p| p.name == body.package.persona.name);
+        .filter(|p| p.name == body.package.persona.name)
+        .collect();
+
+    // `find()` returned whichever homonym came first in list order, so
+    // "replace" could delete a persona the caller never meant to touch — and
+    // persona detect routinely proposes several personas with the same name
+    // (six "src-expert" out of ten on core), so homonyms are the norm.
+    if same_name.len() > 1 && conflict_strategy == "replace" {
+        return Err(AppError::Conflict(format!(
+            "{} personas are named '{}'; refusing to guess which one to replace",
+            same_name.len(),
+            body.package.persona.name
+        )));
+    }
+
+    let existing_match = same_name.first().copied();
 
     if let Some(existing_persona) = existing_match {
         match conflict_strategy {
@@ -1079,10 +1103,15 @@ pub async fn import_persona(
                 ));
             }
             "replace" => {
-                // Delete existing, then fall through to create
-                let _ = neo4j.delete_persona(existing_persona.id).await;
+                // Deleting the old persona must succeed, otherwise the import
+                // silently ends up with two personas of the same name.
+                neo4j
+                    .delete_persona(existing_persona.id)
+                    .await
+                    .map_err(AppError::Internal)?;
             }
-            // "merge" or unknown → fall through, create with new ID
+            // "merge" reuses the existing persona rather than creating a
+            // duplicate. Its notes/decisions/skills are added to it below.
             _ => {}
         }
     }
@@ -1165,12 +1194,28 @@ pub async fn import_persona(
             scar_intensity: 0.0,
         };
 
-        // Create decision with a nil task_id (the trait requires it, but it just creates the node)
+        // The comment this replaces claimed create_decision "just creates the
+        // node". It does not: the query starts with MATCH (t:Task {id:$task_id}),
+        // so with a nil task_id nothing is created — yet graph.run() returns Ok
+        // and the counter was incremented anyway, reporting
+        // decisions_imported: 1 with zero decisions stored.
+        //
+        // Confirm the node exists before counting it.
         if neo4j.create_decision(Uuid::nil(), &decision).await.is_ok() {
-            let _ = neo4j
-                .add_persona_decision(persona.id, decision.id, pd.weight)
-                .await;
-            decisions_imported += 1;
+            match neo4j.get_decision(decision.id).await {
+                Ok(Some(_)) => {
+                    let _ = neo4j
+                        .add_persona_decision(persona.id, decision.id, pd.weight)
+                        .await;
+                    decisions_imported += 1;
+                }
+                _ => {
+                    tracing::warn!(
+                        decision_id = %decision.id,
+                        "Persona decision not imported: decisions require a task to attach to"
+                    );
+                }
+            }
         }
     }
 

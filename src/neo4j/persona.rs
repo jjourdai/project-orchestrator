@@ -562,18 +562,39 @@ impl Neo4jClient {
         function_id: &str,
         weight: f64,
     ) -> Result<()> {
+        // Callers pass a function NAME (persona_handlers uses body.function_name
+        // and, for auto_build, func.name) but Function.id is the composite
+        // "file_path:name:line". Matching on id alone therefore bound nothing,
+        // the MERGE never fired, and the API still answered {"added": true} —
+        // which is why auto_build(entry_function) always produced an empty
+        // persona. Accept either form, and report whether anything was linked.
         let q = query(
             r#"
-            MATCH (p:Persona {id: $persona_id}), (fn:Function {id: $function_id})
+            MATCH (p:Persona {id: $persona_id})
+            MATCH (fn:Function)
+            WHERE fn.id = $function_ref OR fn.name = $function_ref
+            WITH p, fn LIMIT 1
             MERGE (p)-[r:KNOWS]->(fn)
             SET r.weight = $weight
+            RETURN count(r) AS linked
             "#,
         )
         .param("persona_id", persona_id.to_string())
-        .param("function_id", function_id)
+        .param("function_ref", function_id)
         .param("weight", weight);
 
-        self.graph.run(q).await.context("add_persona_function")?;
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("add_persona_function")?;
+        let linked = match result.next().await? {
+            Some(row) => row.get::<i64>("linked").unwrap_or(0) > 0,
+            None => false,
+        };
+        if !linked {
+            anyhow::bail!("No function matching '{}' found", function_id);
+        }
         Ok(())
     }
 
@@ -899,6 +920,16 @@ impl Neo4jClient {
                 MATCH (p:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:INCLUDES_ENTITY]->(f:File {path: $file_path})
                 WHERE p.status <> 'archived'
                 RETURN p, 0.3 AS weight
+                UNION
+                // Inherited knowledge: a persona that EXTENDS an ancestor
+                // knowing this file knows it too. add_extends wrote the relation
+                // but no read path traversed it, so a child persona was invisible
+                // here and its subgraph came back empty — while the docs promised
+                // "child inherits parent's KNOWS".
+                // Slightly discounted per hop so the most specific persona wins.
+                MATCH (p:Persona {project_id: $project_id})-[:EXTENDS*1..3]->(anc:Persona)-[r:KNOWS]->(f:File {path: $file_path})
+                WHERE p.status <> 'archived'
+                RETURN p, r.weight * 0.9 AS weight
             }
             WITH p, max(weight) AS weight
             RETURN p, weight
@@ -914,6 +945,11 @@ impl Neo4jClient {
                 MATCH (p:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:INCLUDES_ENTITY]->(f:File)
                 WHERE f.path ENDS WITH $file_path AND f.path ENDS WITH ('/' + $file_path) AND p.status <> 'archived'
                 RETURN p, 0.3 AS weight
+                UNION
+                // Inherited knowledge — see the absolute-path branch above.
+                MATCH (p:Persona {project_id: $project_id})-[:EXTENDS*1..3]->(anc:Persona)-[r:KNOWS]->(f:File)
+                WHERE f.path ENDS WITH $file_path AND f.path ENDS WITH ('/' + $file_path) AND p.status <> 'archived'
+                RETURN p, r.weight * 0.9 AS weight
             }
             WITH p, max(weight) AS weight
             RETURN p, weight
