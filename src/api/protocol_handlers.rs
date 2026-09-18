@@ -38,29 +38,24 @@ fn validate_transition_state_types(
     from_state_id: Uuid,
     to_state_id: Uuid,
 ) -> Result<(), String> {
-    // Unknown ids must be rejected, not skipped. Using `if let Some(..)` alone
-    // let a transition between two non-existent states through on the create
-    // path, while add_transition correctly 400s on the same input.
-    let from_s = states
-        .iter()
-        .find(|s| s.id == from_state_id)
-        .ok_or_else(|| format!("from_state {} not found in protocol", from_state_id))?;
-    if from_s.state_type == crate::protocol::StateType::Terminal {
-        return Err(format!(
-            "Cannot add transition from terminal state '{}'",
-            from_s.name
-        ));
+    // Deliberately validates TYPES ONLY, as the name says. Unknown ids are not
+    // this function's business — existence is checked by the caller, because
+    // only the caller knows which state list is authoritative.
+    if let Some(from_s) = states.iter().find(|s| s.id == from_state_id) {
+        if from_s.state_type == crate::protocol::StateType::Terminal {
+            return Err(format!(
+                "Cannot add transition from terminal state '{}'",
+                from_s.name
+            ));
+        }
     }
-
-    let to_s = states
-        .iter()
-        .find(|s| s.id == to_state_id)
-        .ok_or_else(|| format!("to_state {} not found in protocol", to_state_id))?;
-    if to_s.state_type == crate::protocol::StateType::Start {
-        return Err(format!(
-            "Cannot add transition to start state '{}'",
-            to_s.name
-        ));
+    if let Some(to_s) = states.iter().find(|s| s.id == to_state_id) {
+        if to_s.state_type == crate::protocol::StateType::Start {
+            return Err(format!(
+                "Cannot add transition to start state '{}'",
+                to_s.name
+            ));
+        }
     }
     Ok(())
 }
@@ -555,6 +550,21 @@ pub async fn create_protocol(
                     "trigger too long ({} > {} chars)",
                     t.trigger.len(),
                     MAX_TRIGGER_LEN
+                )));
+            }
+            // Verify both states exist, exactly as add_transition does. Without
+            // this, create accepted transitions between states that do not
+            // exist while add_transition rejected the same input with a 400.
+            if !created_states.iter().any(|s| s.id == t.from_state) {
+                return Err(AppError::BadRequest(format!(
+                    "from_state {} not found in protocol",
+                    t.from_state
+                )));
+            }
+            if !created_states.iter().any(|s| s.id == t.to_state) {
+                return Err(AppError::BadRequest(format!(
+                    "to_state {} not found in protocol",
+                    t.to_state
                 )));
             }
             // Validate state types: no transition FROM terminal or TO start
