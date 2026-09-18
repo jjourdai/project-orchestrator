@@ -1025,8 +1025,14 @@ impl NoteManager {
             .into_iter()
             .map(|(note, score)| {
                 let scar_penalty = 1.0 - note.scar_intensity.clamp(0.0, 1.0) * 0.5;
+                // Apply the requested intent profile. Until now `profile` was
+                // consumed by a tracing::debug! and nothing else, so the
+                // documented promise that it "weights the search results
+                // according to the profile's configuration" was false: results
+                // were bit-identical with and without it.
+                let profile_boost = profile_weight(profile, &note);
                 NoteSearchHit {
-                    score: score * scar_penalty,
+                    score: score * scar_penalty * profile_boost,
                     note,
                     highlights: None,
                 }
@@ -3249,5 +3255,92 @@ mod tests {
         assert!(!note.content.contains("## Problem"));
         // And no rfc-run tag
         assert!(!note.tags.iter().any(|t| t.starts_with("rfc-run:")));
+    }
+}
+
+/// Score multiplier expressing what an intent profile cares about.
+///
+/// Boosts the note types that answer the question the caller is actually
+/// asking. Kept deliberately mild (1.0–1.35) so it re-ranks near-ties without
+/// overriding semantic similarity, exactly like the scar penalty it sits
+/// beside. An unknown or absent profile is neutral (1.0).
+pub(crate) fn profile_weight(profile: Option<&str>, note: &Note) -> f64 {
+    let Some(profile) = profile else { return 1.0 };
+    use NoteType::*;
+    let boosted: &[NoteType] = match profile.trim().to_lowercase().as_str() {
+        // Chasing a defect: past traps and observations first.
+        "debug" => &[Gotcha, Observation],
+        // Mapping unfamiliar ground: orientation material first.
+        "explore" | "onboarding" => &[Context, Pattern, Guideline],
+        // Judging blast radius: recorded constraints and traps.
+        "impact" | "refactoring" => &[Gotcha, Pattern, Assertion],
+        // Deciding what to do next: rules and proposals.
+        "plan" | "architect" => &[Guideline, Rfc, Pattern],
+        // Security review: hard rules and known traps.
+        "security" => &[Assertion, Gotcha, Guideline],
+        _ => return 1.0,
+    };
+    if boosted.first() == Some(&note.note_type) {
+        1.35
+    } else if boosted.contains(&note.note_type) {
+        1.15
+    } else {
+        1.0
+    }
+}
+
+#[cfg(test)]
+mod profile_weight_tests {
+    use super::*;
+    use crate::notes::models::{Note, NoteType};
+
+    fn note_of(t: NoteType) -> Note {
+        let mut n = Note::new(None, t, "content".to_string(), "test".to_string());
+        n.scar_intensity = 0.0;
+        n
+    }
+
+    /// The parameter was documented as weighting results and did nothing at
+    /// all: scores were bit-identical with and without it.
+    #[test]
+    fn profile_changes_the_ranking() {
+        let gotcha = note_of(NoteType::Gotcha);
+        let context = note_of(NoteType::Context);
+
+        // debug favours gotchas over context
+        assert!(
+            profile_weight(Some("debug"), &gotcha) > profile_weight(Some("debug"), &context),
+            "debug must rank a gotcha above a context note"
+        );
+        // explore favours the opposite
+        assert!(
+            profile_weight(Some("explore"), &context) > profile_weight(Some("explore"), &gotcha),
+            "explore must rank a context note above a gotcha"
+        );
+    }
+
+    #[test]
+    fn absent_or_unknown_profile_is_neutral() {
+        let n = note_of(NoteType::Gotcha);
+        assert_eq!(profile_weight(None, &n), 1.0);
+        assert_eq!(profile_weight(Some("not-a-profile"), &n), 1.0);
+        assert_eq!(profile_weight(Some(""), &n), 1.0);
+    }
+
+    /// Mild enough to re-rank near-ties without overriding similarity.
+    #[test]
+    fn weighting_stays_within_a_narrow_band() {
+        for p in ["debug", "explore", "impact", "plan", "security", "onboarding"] {
+            for t in [
+                NoteType::Gotcha,
+                NoteType::Context,
+                NoteType::Pattern,
+                NoteType::Guideline,
+                NoteType::Tip,
+            ] {
+                let w = profile_weight(Some(p), &note_of(t));
+                assert!((1.0..=1.35).contains(&w), "{p}/{t:?} out of band: {w}");
+            }
+        }
     }
 }
