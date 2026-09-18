@@ -2076,7 +2076,7 @@ impl GraphStore for Neo4jClient {
         self.update_energy_scores(half_life_days).await
     }
 
-    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> anyhow::Result<()> {
+    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> anyhow::Result<bool> {
         self.boost_energy(note_id, amount).await
     }
 

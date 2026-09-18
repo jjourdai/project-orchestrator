@@ -2671,7 +2671,13 @@ impl Neo4jClient {
     }
 
     /// Boost a note's energy by `amount` (capped at 1.0) and reset `last_activated` to now.
-    pub async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()> {
+    /// Boost a note's energy.
+    ///
+    /// Returns whether a note was actually updated. A zero-row MATCH is not an
+    /// error in Cypher, so callers that counted `is_ok()` were counting
+    /// CANDIDATES, not writes — reporting "3 neurons boosted" for three ids
+    /// that matched nothing.
+    pub async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<bool> {
         let q = query(
             r#"
             MATCH (n:Note {id: $id})
@@ -2682,13 +2688,18 @@ impl Neo4jClient {
                  END AS current_e
             SET n.energy = CASE WHEN current_e + $amount > 1.0 THEN 1.0 ELSE current_e + $amount END,
                 n.last_activated = datetime()
+            RETURN count(n) AS updated
             "#,
         )
         .param("id", note_id.to_string())
         .param("amount", amount);
 
-        self.graph.run(q).await?;
-        Ok(())
+        let mut result = self.graph.execute(q).await?;
+        let updated = match result.next().await? {
+            Some(row) => row.get::<i64>("updated").unwrap_or(0) > 0,
+            None => false,
+        };
+        Ok(updated)
     }
 
     /// Track re-activation: increment reactivation_count and set last_reactivated.
@@ -2778,8 +2789,32 @@ impl Neo4jClient {
         )
         .await?;
 
-        // Each pair creates/updates 2 synapses (bidirectional)
-        Ok(pair_count * 2)
+        // Report synapses actually written, not pairs attempted.
+        //
+        // The query MATCHes both notes, so only pairs whose BOTH endpoints
+        // exist produce synapses. Returning pair_count * 2 counted every
+        // candidate pair, so feeding ids that match nothing still reported a
+        // confident "N synapses reinforced".
+        let existing: i64 = {
+            let q = query("MATCH (n:Note) WHERE n.id IN $ids RETURN count(n) AS c")
+                .param(
+                    "ids",
+                    note_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                );
+            let mut result = self.graph.execute(q).await?;
+            match result.next().await? {
+                Some(row) => row.get::<i64>("c").unwrap_or(0),
+                None => 0,
+            }
+        };
+        let _ = pair_count;
+        let real_pairs = if existing < 2 {
+            0
+        } else {
+            (existing as usize * (existing as usize - 1)) / 2
+        };
+        // Each surviving pair creates/updates 2 synapses (bidirectional).
+        Ok(real_pairs * 2)
     }
 
     /// Decay all synapses and prune weak ones.

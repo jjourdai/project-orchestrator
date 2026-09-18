@@ -211,10 +211,23 @@ pub async fn reason_feedback(
         // The followed_nodes are ReasoningNode IDs which map to note/decision UUIDs
         // We need to boost the underlying notes' energy
         for node_id in &body.followed_nodes {
-            // Try to boost as a note (most common entity in reasoning trees)
-            if neo4j.boost_energy(*node_id, energy_boost).await.is_ok() {
-                neurons_boosted += 1;
+            // Count nodes actually updated, not calls that merely did not error.
+            // A zero-row MATCH is Ok(()) in Cypher, so the previous `is_ok()`
+            // reported a boost for ids that matched nothing at all.
+            match neo4j.boost_energy(*node_id, energy_boost).await {
+                Ok(true) => neurons_boosted += 1,
+                Ok(false) => {
+                    tracing::debug!(%node_id, "Feedback id matched no note — not boosted")
+                }
+                Err(e) => tracing::warn!(%node_id, error = %e, "boost_energy failed"),
             }
+        }
+        if neurons_boosted == 0 && !body.followed_nodes.is_empty() {
+            tracing::warn!(
+                submitted = body.followed_nodes.len(),
+                "No followed_nodes matched a note. Pass the node's entity_id \
+                 (the underlying note/decision UUID), not the ReasoningNode id."
+            );
         }
 
         // Reinforce synapses between the followed nodes (Hebbian: co-activated = stronger)

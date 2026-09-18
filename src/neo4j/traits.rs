@@ -1699,7 +1699,7 @@ pub trait GraphStore: Send + Sync {
     /// Boost a note's energy by a given amount (capped at 1.0) and set
     /// `last_activated` to now. Used when a note is retrieved, confirmed, or
     /// reinforced through spreading activation.
-    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()>;
+    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<bool>;
 
     /// Track re-activation of notes: increment `reactivation_count` and set `last_reactivated`.
     /// Used to measure route quality — notes that are frequently re-activated are more valuable.

@@ -6227,15 +6227,17 @@ impl GraphStore for MockGraphStore {
         Ok(updated)
     }
 
-    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()> {
+    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<bool> {
         let mut notes = self.notes.write().await;
         if let Some(note) = notes.get_mut(&note_id) {
             // Lazy decay: compute current energy before adding boost
             let current_e = note.computed_energy();
             note.energy = (current_e + amount).min(1.0);
             note.last_activated = Some(chrono::Utc::now());
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     async fn track_reactivation(&self, note_ids: &[Uuid]) -> Result<usize> {
