@@ -218,8 +218,18 @@ impl Neo4jClient {
         while let Some(row) = result.next().await? {
             files.push(CommitFileInfo {
                 path: row.get("path")?,
-                additions: row.get::<Option<i64>>("additions").ok().flatten(),
-                deletions: row.get::<Option<i64>>("deletions").ok().flatten(),
+                // -1 is the writer's "unknown" sentinel (see insert above); without
+                // filtering it, an unknown count reads back as Some(-1).
+                additions: row
+                    .get::<Option<i64>>("additions")
+                    .ok()
+                    .flatten()
+                    .filter(|v| *v >= 0),
+                deletions: row
+                    .get::<Option<i64>>("deletions")
+                    .ok()
+                    .flatten()
+                    .filter(|v| *v >= 0),
             });
         }
 
@@ -261,8 +271,18 @@ impl Neo4jClient {
                     .get::<String>("timestamp")?
                     .parse()
                     .unwrap_or_else(|_| chrono::Utc::now()),
-                additions: row.get::<Option<i64>>("additions").ok().flatten(),
-                deletions: row.get::<Option<i64>>("deletions").ok().flatten(),
+                // -1 is the writer's "unknown" sentinel (see insert above); without
+                // filtering it, an unknown count reads back as Some(-1).
+                additions: row
+                    .get::<Option<i64>>("additions")
+                    .ok()
+                    .flatten()
+                    .filter(|v| *v >= 0),
+                deletions: row
+                    .get::<Option<i64>>("deletions")
+                    .ok()
+                    .flatten()
+                    .filter(|v| *v >= 0),
             });
         }
 

@@ -278,7 +278,8 @@ impl Neo4jClient {
             OPTIONAL MATCH (m)-[:INCLUDES_TASK]->(t1:Task)
             OPTIONAL MATCH (p:Plan)-[:TARGETS_MILESTONE]->(m), (p)-[:HAS_TASK]->(t2:Task)
             WITH m,
-                 [x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL] AS tasks
+                 apoc.coll.toSet([x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL])
+                 AS tasks
             RETURN m, tasks
             "#,
         )
@@ -311,7 +312,8 @@ impl Neo4jClient {
             MATCH (m:Milestone {id: $id})
             OPTIONAL MATCH (m)-[:INCLUDES_TASK]->(t1:Task)
             OPTIONAL MATCH (p:Plan)-[:TARGETS_MILESTONE]->(m), (p)-[:HAS_TASK]->(t2:Task)
-            WITH [x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL] AS tasks
+            WITH apoc.coll.toSet([x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL])
+                 AS tasks
             RETURN
                 size(tasks) AS total,
                 size([t IN tasks WHERE t.status = 'Completed']) AS completed,
@@ -355,7 +357,8 @@ impl Neo4jClient {
             MATCH (m:Milestone {id: $milestone_id})
             OPTIONAL MATCH (m)-[:INCLUDES_TASK]->(t1:Task)
             OPTIONAL MATCH (p:Plan)-[:TARGETS_MILESTONE]->(m), (p)-[:HAS_TASK]->(t2:Task)
-            WITH [x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL] AS tasks
+            WITH apoc.coll.toSet([x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL])
+                 AS tasks
             UNWIND tasks AS t
             OPTIONAL MATCH (pl:Plan)-[:HAS_TASK]->(t)
             WITH t, collect(pl)[0] AS first_plan
@@ -404,7 +407,8 @@ impl Neo4jClient {
             MATCH (m:Milestone {id: $milestone_id})
             OPTIONAL MATCH (m)-[:INCLUDES_TASK]->(t1:Task)
             OPTIONAL MATCH (p:Plan)-[:TARGETS_MILESTONE]->(m), (p)-[:HAS_TASK]->(t2:Task)
-            WITH [x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL] AS tasks
+            WITH apoc.coll.toSet([x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL])
+                 AS tasks
             UNWIND tasks AS t
             WITH DISTINCT t
             MATCH (t)-[:HAS_STEP]->(s:Step)
@@ -480,7 +484,8 @@ impl Neo4jClient {
             MATCH (m:Milestone {id: $id})
             OPTIONAL MATCH (m)-[:INCLUDES_TASK]->(t1:Task)
             OPTIONAL MATCH (p:Plan)-[:TARGETS_MILESTONE]->(m), (p)-[:HAS_TASK]->(t2:Task)
-            WITH [x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL] AS tasks
+            WITH apoc.coll.toSet([x IN collect(DISTINCT t1) + collect(DISTINCT t2) WHERE x IS NOT NULL])
+                 AS tasks
             UNWIND tasks AS t
             WITH DISTINCT t
             RETURN t

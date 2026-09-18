@@ -121,7 +121,15 @@ impl Neo4jClient {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .and_then(|s| serde_json::from_str(&s).ok()),
-            state_timeout_secs: node.get::<i64>("state_timeout_secs").ok().map(|v| v as u64),
+            // The writer stores -1 as the "no explicit timeout" sentinel. Without
+            // this filter the sentinel is resurrected as Some(...) — surfacing as
+            // 255, the Bolt INT8 0xFF read unsigned — so the field was NEVER None
+            // and the 300s/1800s defaults in protocol::runner could never apply.
+            state_timeout_secs: node
+                .get::<i64>("state_timeout_secs")
+                .ok()
+                .filter(|v| *v >= 0)
+                .map(|v| v as u64),
         })
     }
 
