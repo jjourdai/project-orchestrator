@@ -129,6 +129,8 @@ pub struct MockGraphStore {
     pub note_embeddings: RwLock<HashMap<Uuid, (Vec<f32>, String)>>,
     /// Note synapses: bidirectional adjacency list (note_id -> Vec<(neighbor_id, weight)>)
     pub note_synapses: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
+    /// Composition reports per chat session (JSON), keyed by session id.
+    pub composition_reports: RwLock<HashMap<Uuid, String>>,
     /// Synapse source tags: (note_a, note_b) -> source ("cosine" | "coactivation")
     /// Sorted key pair (min, max) to ensure canonical ordering.
     pub synapse_sources: RwLock<HashMap<(Uuid, Uuid), String>>,
@@ -286,6 +288,7 @@ impl MockGraphStore {
             function_analytics: RwLock::new(HashMap::new()),
             note_embeddings: RwLock::new(HashMap::new()),
             note_synapses: RwLock::new(HashMap::new()),
+            composition_reports: RwLock::new(HashMap::new()),
             synapse_sources: RwLock::new(HashMap::new()),
             file_embeddings: RwLock::new(HashMap::new()),
             function_embeddings: RwLock::new(HashMap::new()),
@@ -6954,6 +6957,17 @@ impl GraphStore for MockGraphStore {
             session.updated_at = Utc::now();
         }
         Ok(())
+    }
+
+    async fn set_composition_report(&self, id: Uuid, report_json: &str) -> Result<()> {
+        let mut reports = self.composition_reports.write().await;
+        reports.insert(id, report_json.to_string());
+        Ok(())
+    }
+
+    async fn get_composition_report(&self, id: Uuid) -> Result<Option<String>> {
+        let reports = self.composition_reports.read().await;
+        Ok(reports.get(&id).cloned())
     }
 
     async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()> {

@@ -2283,6 +2283,14 @@ impl GraphStore for Neo4jClient {
         self.update_chat_session_model(id, model).await
     }
 
+    async fn set_composition_report(&self, id: Uuid, report_json: &str) -> anyhow::Result<()> {
+        self.set_composition_report(id, report_json).await
+    }
+
+    async fn get_composition_report(&self, id: Uuid) -> anyhow::Result<Option<String>> {
+        self.get_composition_report(id).await
+    }
+
     async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> anyhow::Result<()> {
         self.set_session_auto_continue(id, enabled).await
     }

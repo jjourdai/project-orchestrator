@@ -1744,6 +1744,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(chat_handlers::get_session_tree),
         )
         .route(
+            "/api/chat/sessions/{id}/composition-report",
+            get(chat_handlers::get_composition_report),
+        )
+        .route(
             "/api/chat/runs/{run_id}/sessions",
             get(chat_handlers::get_run_sessions),
         )

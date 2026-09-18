@@ -808,12 +808,7 @@ fn parse_markdown_sections(text: &str) -> Vec<MdSection> {
 /// item at the top. Section headers survive even when all their items are
 /// dropped, so the reader can still see that a section existed and how much
 /// of it was withheld.
-#[cfg(test)]
-fn render_sections_budgeted(sections: &mut [MdSection], char_budget: usize) -> String {
-    render_sections_budgeted_reported(sections, char_budget).0
-}
-
-/// As [`render_sections_budgeted`], but also returns what it removed.
+/// Also returns what it removed.
 ///
 /// The detail is built by the truncation itself rather than reconstructed
 /// afterwards, so the numbers reported cannot drift from the bytes written —

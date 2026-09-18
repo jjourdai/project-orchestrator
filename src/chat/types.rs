@@ -502,6 +502,13 @@ pub enum ChatEvent {
         /// Permission mode for this session
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_mode: Option<String>,
+        /// What went into this session's system prompt, and what was cut.
+        ///
+        /// Absent for sessions opened before the report existed, and for
+        /// sessions with no project context. A frontend must read its absence
+        /// as "not recorded" — never as "nothing was truncated".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        composition: Option<crate::chat::composition_report::CompositionSummary>,
     },
     /// Claude Code Dynamic Workflow lifecycle event (intra-task sub-agent fan-out).
     ///
@@ -1666,6 +1673,7 @@ mod tests {
                 tools: vec!["Bash".into(), "Read".into(), "Write".into()],
                 mcp_servers: vec![serde_json::json!({"name": "po", "status": "connected"})],
                 permission_mode: Some("default".into()),
+                composition: None,
             },
             ChatEvent::SystemInit {
                 cli_session_id: "cli-init-456".into(),
@@ -1673,6 +1681,7 @@ mod tests {
                 tools: vec![],
                 mcp_servers: vec![],
                 permission_mode: None,
+                composition: None,
             },
             ChatEvent::AutoContinue {
                 session_id: "sess-auto-1".into(),

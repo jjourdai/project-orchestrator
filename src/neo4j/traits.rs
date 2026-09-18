@@ -1894,6 +1894,13 @@ pub trait GraphStore: Send + Sync {
     /// survives idle-cleanup and is honored on resume/respawn)
     async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()>;
 
+    /// Store the composition report for a session's system prompt (JSON).
+    async fn set_composition_report(&self, id: Uuid, report_json: &str) -> Result<()>;
+
+    /// Read a session's composition report. `None` = never recorded, which is
+    /// not the same as "nothing was truncated".
+    async fn get_composition_report(&self, id: Uuid) -> Result<Option<String>>;
+
     /// Set the auto_continue flag on a chat session node
     async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()>;
 

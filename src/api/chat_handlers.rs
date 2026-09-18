@@ -429,6 +429,37 @@ pub async fn get_session_children(
     Ok(Json(items))
 }
 
+/// GET /api/chat/sessions/{id}/composition-report — What went into this
+/// session's system prompt, and what was cut out of it.
+///
+/// Returns the full report, truncated text included, for any session that has
+/// one. `404` means no report was recorded — a session opened before the
+/// report existed, or one composed without project context. That is not the
+/// same as "nothing was truncated", and a caller must not render it as such.
+pub async fn get_composition_report(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<crate::chat::composition_report::CompositionReport>, AppError> {
+    let json = state
+        .orchestrator
+        .neo4j()
+        .get_composition_report(session_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "No composition report recorded for session {session_id}"
+            ))
+        })?;
+
+    let report: crate::chat::composition_report::CompositionReport =
+        serde_json::from_str(&json).map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("Stored composition report is unreadable: {e}"))
+        })?;
+
+    Ok(Json(report))
+}
+
 /// GET /api/chat/sessions/{id}/tree — Get the full session tree rooted at this session
 pub async fn get_session_tree(
     State(state): State<OrchestratorState>,

@@ -1939,18 +1939,52 @@ impl ChatManager {
         let use_neural = self
             .neural_routing_enabled
             .load(std::sync::atomic::Ordering::Relaxed);
-        let (prompt, routing_record) = {
+        let (prompt, routing_record, composition) = {
             let dtr_guard = self.dual_track_router.read().unwrap();
             if use_neural {
                 if let Some(ref dtr) = *dtr_guard {
-                    FsmPromptComposer::compose_with_record(&input, dtr)
+                    FsmPromptComposer::compose_reported(&input, dtr)
                 } else {
-                    FsmPromptComposer::compose_with_record(&input, &HeuristicRouter)
+                    FsmPromptComposer::compose_reported(&input, &HeuristicRouter)
                 }
             } else {
-                FsmPromptComposer::compose_with_record(&input, &HeuristicRouter)
+                FsmPromptComposer::compose_reported(&input, &HeuristicRouter)
             }
         };
+
+        // Record what went into the prompt — and what did not. Best-effort:
+        // an unobservable composition is a regression, a failed write is not
+        // a reason to refuse the session.
+        if let Some(sid) = session_id {
+            if composition.is_truncated() {
+                warn!(
+                    session_id = %sid,
+                    truncated_chars = composition.truncated_chars,
+                    budget = composition.dynamic_budget_chars,
+                    sections = ?composition
+                        .all_dropped_sections()
+                        .iter()
+                        .map(|d| d.section.as_str())
+                        .collect::<Vec<_>>(),
+                    "System prompt context truncated"
+                );
+            }
+            // Awaited, not spawned: the `system_init` event reads this
+            // report back to fill its chips, and that event follows within
+            // milliseconds. A fire-and-forget write would leave the ordering
+            // to chance, and "it's fast enough in practice" is the reasoning
+            // that produced the bugs this report exists to expose.
+            if let Ok(uuid) = uuid::Uuid::parse_str(sid) {
+                match serde_json::to_string(&composition) {
+                    Ok(json) => {
+                        if let Err(e) = self.graph.set_composition_report(uuid, &json).await {
+                            warn!(error = %e, "Failed to persist composition report");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "Failed to serialize composition report"),
+                }
+            }
+        }
 
         // Emit routing decision to trajectory collector (fire-and-forget)
         {
@@ -2388,6 +2422,9 @@ impl ChatManager {
                             tools,
                             mcp_servers,
                             permission_mode,
+                            // Filled in by the caller, which knows the session
+                            // id; this conversion sees only the CLI message.
+                            composition: None,
                         }]
                     }
                     "compact_boundary" => {
@@ -4187,7 +4224,37 @@ impl ChatManager {
                                 }
 
                                 // Convert to ChatEvent(s) and emit + persist structured events
-                                let events = Self::message_to_events(msg);
+                                let mut events = Self::message_to_events(msg);
+
+                                // `message_to_events` sees only the CLI message,
+                                // so the composition report — which is ours, not
+                                // the CLI's — is attached here, where the session
+                                // id is in scope. Absent report => absent field =>
+                                // no chips, which is also what a session created
+                                // before this feature must produce.
+                                for event in events.iter_mut() {
+                                    if let ChatEvent::SystemInit {
+                                        ref mut composition,
+                                        ..
+                                    } = event
+                                    {
+                                        if let Ok(uuid) = uuid::Uuid::parse_str(&session_id) {
+                                            *composition = graph
+                                                .get_composition_report(uuid)
+                                                .await
+                                                .ok()
+                                                .flatten()
+                                                .and_then(|json| {
+                                                    serde_json::from_str::<
+                                                        super::composition_report::CompositionReport,
+                                                    >(&json)
+                                                    .ok()
+                                                })
+                                                .map(|r| r.summary());
+                                        }
+                                    }
+                                }
+
                                 for event in events {
                                     // Deduplicate ToolUse events — ContentBlockStart and
                                     // AssistantMessage can both produce the same tool_use.
@@ -7815,8 +7882,11 @@ mod tests {
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ChatEvent::SystemInit {
-            cli_session_id, model, tools, mcp_servers, permission_mode,
+            cli_session_id, model, tools, mcp_servers, permission_mode, composition,
         } if cli_session_id == "cli-sess-abc"
+            // The CLI message carries no composition report; it is attached
+            // later, by the caller that knows the session id.
+            && composition.is_none()
             && model.as_deref() == Some("claude-sonnet-4-6")
             && tools.len() == 4
             && mcp_servers.len() == 1

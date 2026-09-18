@@ -106,7 +106,41 @@ pub struct CompositionReport {
     pub truncated_content: String,
 }
 
+/// The part of a [`CompositionReport`] that travels with the `system_init`
+/// event: enough to render the three chips, without the full cut text.
+///
+/// The removed content stays in the persisted report and is fetched on demand
+/// — a prompt's truncated half can be tens of kilobytes, and it does not
+/// belong in every session-open payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompositionSummary {
+    pub static_chars: usize,
+    pub dynamic_chars: usize,
+    pub truncated_chars: usize,
+    pub dynamic_budget_chars: usize,
+    pub total_chars: usize,
+    /// Sections that lost items, worst first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_sections: Vec<DroppedSection>,
+}
+
 impl CompositionReport {
+    /// The chip-sized view of this report.
+    pub fn summary(&self) -> CompositionSummary {
+        CompositionSummary {
+            static_chars: self.static_chars,
+            dynamic_chars: self.dynamic_chars,
+            truncated_chars: self.truncated_chars,
+            dynamic_budget_chars: self.dynamic_budget_chars,
+            total_chars: self.total_chars,
+            dropped_sections: self
+                .all_dropped_sections()
+                .into_iter()
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// Sections that lost items, across every source, worst first.
     pub fn all_dropped_sections(&self) -> Vec<&DroppedSection> {
         let mut all: Vec<&DroppedSection> = self
@@ -190,5 +224,100 @@ mod tests {
             ..Default::default()
         };
         assert!(!report.is_truncated());
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use crate::chat::types::ChatEvent;
+
+    /// A session created before this feature carries no report. The field must
+    /// then be absent from the wire payload entirely — not `null`, not zeros —
+    /// so the frontend renders its banner exactly as it did before and shows
+    /// no chips. Zeros would read as "nothing was truncated", which is a claim
+    /// we cannot make about a session we never measured.
+    #[test]
+    fn system_init_without_a_report_is_wire_compatible() {
+        let event = ChatEvent::SystemInit {
+            cli_session_id: "sid-legacy".to_string(),
+            model: Some("claude-sonnet-4".to_string()),
+            tools: vec!["Bash".to_string()],
+            mcp_servers: vec![],
+            permission_mode: Some("default".to_string()),
+            composition: None,
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(
+            json.get("composition").is_none(),
+            "absent report must not serialize at all, got: {json}"
+        );
+        // The pre-existing metadata is untouched.
+        assert_eq!(json["cli_session_id"], "sid-legacy");
+        assert_eq!(json["model"], "claude-sonnet-4");
+        assert_eq!(json["permission_mode"], "default");
+    }
+
+    /// And a payload written before the field existed must still deserialize.
+    #[test]
+    fn legacy_system_init_payload_still_parses() {
+        let json = r#"{"type":"system_init","cli_session_id":"sid-1","model":"claude-sonnet-4"}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        match event {
+            ChatEvent::SystemInit { composition, .. } => assert!(composition.is_none()),
+            other => panic!("expected SystemInit, got {other:?}"),
+        }
+    }
+
+    /// With a report, the three headline numbers reach the wire.
+    #[test]
+    fn system_init_carries_the_three_chip_numbers() {
+        let report = CompositionReport {
+            static_chars: 42_000,
+            dynamic_chars: 9_800,
+            truncated_chars: 5_100,
+            dynamic_budget_chars: 10_000,
+            total_chars: 51_800,
+            sources: vec![SourceReport {
+                source: DynamicSource::ProjectContext,
+                original_chars: 14_900,
+                kept_chars: 9_800,
+                budget_chars: 10_000,
+                dropped_sections: vec![DroppedSection {
+                    section: "## Global Guidelines".into(),
+                    items_kept: 0,
+                    items_dropped: 6,
+                    chars_dropped: 5_100,
+                }],
+            }],
+            truncated_content: "## Global Guidelines\n- [Critical] warm up\n".into(),
+            ..Default::default()
+        };
+
+        let event = ChatEvent::SystemInit {
+            cli_session_id: "sid-2".to_string(),
+            model: None,
+            tools: vec![],
+            mcp_servers: vec![],
+            permission_mode: None,
+            composition: Some(report.summary()),
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["composition"]["static_chars"], 42_000);
+        assert_eq!(json["composition"]["dynamic_chars"], 9_800);
+        assert_eq!(json["composition"]["truncated_chars"], 5_100);
+        assert_eq!(
+            json["composition"]["dropped_sections"][0]["section"],
+            "## Global Guidelines"
+        );
+
+        // The cut text itself stays out of the session-open payload — it is
+        // fetched on demand from the persisted report.
+        assert!(
+            !json.to_string().contains("warm up"),
+            "the truncated content rode along in the system_init payload"
+        );
     }
 }

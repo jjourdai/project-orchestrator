@@ -298,6 +298,37 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Store the composition report for a session's system prompt.
+    ///
+    /// Persisted rather than merely emitted live: "why did this session not
+    /// see that guideline?" is a question asked about a session that has
+    /// already ended. A live-only summary answers it for the current session
+    /// and no other — which is how a truncation that beheaded whole sections
+    /// of context went unnoticed for months.
+    pub async fn set_composition_report(&self, id: Uuid, report_json: &str) -> Result<()> {
+        let cypher = "MATCH (s:ChatSession {id: $id}) \
+                      SET s.composition_report_json = $report, s.updated_at = datetime()";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("report", report_json.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Read back a session's composition report, if one was recorded.
+    ///
+    /// `None` for sessions created before the report existed — callers must
+    /// treat its absence as "not recorded", never as "nothing was truncated".
+    pub async fn get_composition_report(&self, id: Uuid) -> Result<Option<String>> {
+        let q = query("MATCH (s:ChatSession {id: $id}) RETURN s.composition_report_json AS report")
+            .param("id", id.to_string());
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            return Ok(row.get::<String>("report").ok().filter(|s| !s.is_empty()));
+        }
+        Ok(None)
+    }
+
     /// Set the auto_continue flag on a chat session node.
     pub async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()> {
         let cypher = "MATCH (s:ChatSession {id: $id}) SET s.auto_continue = $enabled, s.updated_at = datetime()";
