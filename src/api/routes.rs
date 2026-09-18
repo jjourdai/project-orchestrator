@@ -1776,6 +1776,16 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/sessions/{id}/cancel-task/{task_id}",
             post(chat_handlers::cancel_task),
         )
+        // Composer attachments (plan 9fc118a3) — raw image bytes in, absolute
+        // path out. The per-route DefaultBodyLimit is REQUIRED: axum's default
+        // is 2 MB, which is below a typical retina screenshot, so without it
+        // pasting a normal screenshot 413s before the handler is reached.
+        .route(
+            "/api/chat/sessions/{id}/attachments",
+            post(chat_handlers::upload_attachment).layer(axum::extract::DefaultBodyLimit::max(
+                chat_handlers::MAX_ATTACHMENT_BYTES,
+            )),
+        )
         // Chat permission config (runtime GET/PUT)
         .route(
             "/api/chat/config/permissions",
