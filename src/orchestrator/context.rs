@@ -57,6 +57,26 @@ impl ContextBuilder {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Plan not found"))?;
 
+        // Resolve the project this plan belongs to. Every search below accepts a
+        // project filter; passing None mixes OTHER projects' code and decisions
+        // into the prompt (measured: a 3-file sandbox task received 17 KB of
+        // context drawn from two unrelated products).
+        let project_slug = self
+            .plan_manager
+            .get_project_slug_for_plan(plan_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, %plan_id, "Failed to resolve project for plan");
+                None
+            });
+        if project_slug.is_none() {
+            tracing::warn!(
+                %plan_id,
+                "Plan is not linked to a project — task context cannot be scoped \
+                 and may include unrelated projects"
+            );
+        }
+
         // Get file contexts for modified files (including notes)
         let mut target_files = Vec::new();
         for file_path in &task_details.modifies_files {
@@ -66,13 +86,17 @@ impl ContextBuilder {
 
         // Search for similar code
         let similar_code = self
-            .search_similar_code(&task_details.task.description, 5)
+            .search_similar_code(&task_details.task.description, 5, project_slug.as_deref())
             .await?;
 
         // Search for related decisions
         let related_decisions = self
             .plan_manager
-            .search_decisions(&task_details.task.description, 5, None)
+            .search_decisions(
+                &task_details.task.description,
+                5,
+                project_slug.as_deref(),
+            )
             .await?;
 
         // Get notes for the task
@@ -255,10 +279,15 @@ impl ContextBuilder {
     }
 
     /// Search for similar code using Meilisearch
-    async fn search_similar_code(&self, query: &str, limit: usize) -> Result<Vec<CodeReference>> {
+    async fn search_similar_code(
+        &self,
+        query: &str,
+        limit: usize,
+        project_slug: Option<&str>,
+    ) -> Result<Vec<CodeReference>> {
         let hits = self
             .meili
-            .search_code_with_scores(query, limit, None, None, None)
+            .search_code_with_scores(query, limit, None, project_slug, None)
             .await?;
 
         let references = hits

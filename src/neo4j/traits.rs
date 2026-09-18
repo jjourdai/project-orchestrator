@@ -770,6 +770,9 @@ pub trait GraphStore: Send + Sync {
     /// Count plans for a project (lightweight, no data transfer)
     async fn count_project_plans(&self, project_id: Uuid) -> Result<i64>;
 
+    /// Resolve the slug of the project a plan belongs to.
+    async fn get_project_slug_for_plan(&self, plan_id: Uuid) -> Result<Option<String>>;
+
     /// List plans for a project with filters
     async fn list_plans_for_project(
         &self,

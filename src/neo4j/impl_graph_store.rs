@@ -962,6 +962,10 @@ impl GraphStore for Neo4jClient {
         self.count_project_plans(project_id).await
     }
 
+    async fn get_project_slug_for_plan(&self, plan_id: Uuid) -> anyhow::Result<Option<String>> {
+        self.get_project_slug_for_plan(plan_id).await
+    }
+
     async fn list_plans_for_project(
         &self,
         project_id: Uuid,

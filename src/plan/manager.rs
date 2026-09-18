@@ -195,6 +195,31 @@ impl PlanManager {
 
         self.neo4j.create_task(plan_id, &task).await?;
 
+        // Materialise affected_files as (Task)-[:MODIFIES]->(File).
+        //
+        // The paths were only ever stored as a node PROPERTY, so the relation
+        // did not exist and get_task_with_full_details returned modifies_files:
+        // [] — which is what build_context iterates to assemble target_files.
+        // The result was a task prompt with no information at all about the
+        // files the caller explicitly asked to change.
+        //
+        // Best-effort: MERGE only fires for files already in the graph (a task
+        // may legitimately name a file that does not exist yet), so a miss must
+        // not fail task creation. It is logged rather than swallowed.
+        if !task.affected_files.is_empty() {
+            if let Err(e) = self
+                .neo4j
+                .link_task_to_files(task.id, &task.affected_files)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    task_id = %task.id,
+                    "Failed to link task to its affected files"
+                );
+            }
+        }
+
         // Add dependencies
         if let Some(deps) = req.depends_on {
             for dep_id in deps {
@@ -606,6 +631,13 @@ impl PlanManager {
     }
 
     /// Search for related decisions
+    /// Resolve the slug of the project a plan belongs to.
+    ///
+    /// Used to scope the searches that build a task's execution context.
+    pub async fn get_project_slug_for_plan(&self, plan_id: Uuid) -> Result<Option<String>> {
+        self.neo4j.get_project_slug_for_plan(plan_id).await
+    }
+
     pub async fn search_decisions(
         &self,
         query: &str,
@@ -932,6 +964,101 @@ mod tests {
     // =========================================================================
     // Task CRUD
     // =========================================================================
+
+    /// T2: affected_files must become (Task)-[:MODIFIES]->(File), otherwise
+    /// get_task_details returns modifies_files: [] and the task prompt carries
+    /// no information about the files the caller asked to change.
+    #[tokio::test]
+    async fn test_add_task_materialises_affected_files_as_modifies() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        // The file must exist in the graph for MERGE to fire.
+        let file = crate::neo4j::models::FileNode {
+            path: "src/api/routes.rs".to_string(),
+            language: "rust".to_string(),
+            hash: "deadbeef".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: None,
+        };
+        pm.neo4j.upsert_file(&file).await.unwrap();
+
+        let task = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Touch routes".to_string()),
+                    description: "Edit the router".to_string(),
+                    priority: Some(5),
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: Some(vec!["src/api/routes.rs".to_string()]),
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let details = pm.get_task_details(task.id).await.unwrap().unwrap();
+        assert_eq!(
+            details.modifies_files,
+            vec!["src/api/routes.rs".to_string()],
+            "affected_files must be reachable as MODIFIES, not just a property"
+        );
+    }
+
+    /// A task naming a file that is not in the graph must still be created.
+    #[tokio::test]
+    async fn test_add_task_tolerates_unknown_affected_file() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        let task = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("New file".to_string()),
+                    description: "Create something that does not exist yet".to_string(),
+                    priority: Some(5),
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: Some(vec!["src/does/not/exist.rs".to_string()]),
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(task.affected_files, vec!["src/does/not/exist.rs".to_string()]);
+    }
 
     #[tokio::test]
     async fn test_add_task() {

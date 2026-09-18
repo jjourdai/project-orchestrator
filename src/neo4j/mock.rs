@@ -3356,6 +3356,17 @@ impl GraphStore for MockGraphStore {
         Ok(count as i64)
     }
 
+    async fn get_project_slug_for_plan(&self, plan_id: Uuid) -> Result<Option<String>> {
+        let pp = self.project_plans.read().await;
+        let projects = self.projects.read().await;
+        for (project_id, plan_ids) in pp.iter() {
+            if plan_ids.contains(&plan_id) {
+                return Ok(projects.get(project_id).map(|p| p.slug.clone()));
+            }
+        }
+        Ok(None)
+    }
+
     async fn list_plans_for_project(
         &self,
         project_id: Uuid,

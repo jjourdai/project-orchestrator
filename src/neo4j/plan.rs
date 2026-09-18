@@ -305,6 +305,25 @@ impl Neo4jClient {
         }
     }
 
+    /// Resolve the slug of the project a plan belongs to.
+    ///
+    /// Needed to scope the searches that build a task's execution context: they
+    /// all accept a `project_slug` filter, and passing None silently mixes other
+    /// projects' code and decisions into the prompt.
+    pub async fn get_project_slug_for_plan(&self, plan_id: Uuid) -> Result<Option<String>> {
+        let q = query(
+            "MATCH (project:Project)-[:HAS_PLAN]->(p:Plan {id: $plan_id}) RETURN project.slug AS slug LIMIT 1",
+        )
+        .param("plan_id", plan_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<String>("slug").ok())
+        } else {
+            Ok(None)
+        }
+    }
+
     /// List plans for a project with filters
     pub async fn list_plans_for_project(
         &self,
