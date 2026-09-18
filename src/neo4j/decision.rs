@@ -304,6 +304,36 @@ impl Neo4jClient {
 
     /// Get all decisions with their linked task_id.
     /// Used by the reindex command to rebuild MeiliSearch from Neo4j.
+    /// Fetch one decision together with the task it informs.
+    ///
+    /// Needed to rebuild its search document after an update — the index needs
+    /// the task id, which the decision node alone does not carry.
+    pub async fn get_decision_with_task_id(
+        &self,
+        decision_id: Uuid,
+    ) -> Result<Option<(DecisionNode, Uuid)>> {
+        let q = query(
+            r#"
+            MATCH (t:Task)-[:INFORMED_BY]->(d:Decision {id: $id})
+            RETURN d, t.id AS task_id
+            LIMIT 1
+            "#,
+        )
+        .param("id", decision_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("d")?;
+            let task_id_str: String = row.get("task_id")?;
+            if let (Ok(decision), Ok(task_id)) =
+                (Self::node_to_decision(&node), task_id_str.parse::<Uuid>())
+            {
+                return Ok(Some((decision, task_id)));
+            }
+        }
+        Ok(None)
+    }
+
     pub async fn get_all_decisions_with_task_id(&self) -> Result<Vec<(DecisionNode, Uuid)>> {
         let q = query(
             r#"

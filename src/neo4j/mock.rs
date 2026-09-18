@@ -4446,6 +4446,14 @@ impl GraphStore for MockGraphStore {
         Ok(result)
     }
 
+    async fn get_decision_with_task_id(
+        &self,
+        decision_id: Uuid,
+    ) -> Result<Option<(DecisionNode, Uuid)>> {
+        let all = self.get_all_decisions_with_task_id().await?;
+        Ok(all.into_iter().find(|(d, _)| d.id == decision_id))
+    }
+
     async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>> {
         let decisions = self.decisions.read().await;
         Ok(decisions

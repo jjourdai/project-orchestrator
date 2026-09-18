@@ -4492,6 +4492,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         self.neo4j()
             .update_decision(decision_id, description, rationale, chosen_option, status)
             .await?;
+        // Keep the search index in step with the graph; otherwise search serves
+        // the old text indefinitely. Best-effort: the write already succeeded.
+        if let Err(e) = self.plan_manager().reindex_decision(decision_id).await {
+            tracing::warn!(%decision_id, error = %e, "Failed to reindex decision after update");
+        }
         self.emit(CrudEvent::new(
             EventEntityType::Decision,
             CrudAction::Updated,
@@ -4503,6 +4508,12 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     /// Delete a decision and emit event
     pub async fn delete_decision(&self, decision_id: Uuid) -> Result<()> {
         self.neo4j().delete_decision(decision_id).await?;
+        // Drop it from the search index too — NoteManager::delete_note already
+        // does this for notes. Skipping it leaves a document that `get` 404s on
+        // but `search` keeps returning, with no supported way to remove it.
+        if let Err(e) = self.plan_manager().remove_decision_from_index(decision_id).await {
+            tracing::warn!(%decision_id, error = %e, "Failed to deindex deleted decision");
+        }
         self.emit(CrudEvent::new(
             EventEntityType::Decision,
             CrudAction::Deleted,

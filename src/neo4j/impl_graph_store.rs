@@ -1259,6 +1259,13 @@ impl GraphStore for Neo4jClient {
         self.get_all_decisions_with_task_id().await
     }
 
+    async fn get_decision_with_task_id(
+        &self,
+        decision_id: Uuid,
+    ) -> anyhow::Result<Option<(DecisionNode, Uuid)>> {
+        self.get_decision_with_task_id(decision_id).await
+    }
+
     async fn get_decisions_without_embedding(&self) -> anyhow::Result<Vec<(Uuid, String, String)>> {
         self.get_decisions_without_embedding().await
     }

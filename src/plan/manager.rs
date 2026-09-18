@@ -518,6 +518,41 @@ impl PlanManager {
     /// into MeiliSearch. Useful after MeiliSearch data loss or rebuild.
     ///
     /// Returns `(total_decisions, indexed_count)`.
+    /// Re-index a single decision after it changed.
+    ///
+    /// Without this, `decision.search` keeps serving the pre-update text while
+    /// `decision.get` returns the new one.
+    pub async fn reindex_decision(&self, decision_id: Uuid) -> Result<()> {
+        let Some((decision, task_id)) = self.neo4j.get_decision_with_task_id(decision_id).await?
+        else {
+            return Ok(());
+        };
+        let (project_id, project_slug) = match self.neo4j.get_project_for_task(task_id).await {
+            Ok(Some(project)) => (Some(project.id.to_string()), Some(project.slug.clone())),
+            _ => (None, None),
+        };
+        let doc = DecisionDocument {
+            id: decision.id.to_string(),
+            description: decision.description.clone(),
+            rationale: decision.rationale.clone(),
+            task_id: task_id.to_string(),
+            agent: decision.decided_by.clone(),
+            timestamp: decision.decided_at.to_rfc3339(),
+            tags: vec![],
+            project_id,
+            project_slug,
+        };
+        self.meili.index_decision(&doc).await
+    }
+
+    /// Drop a decision from the search index.
+    ///
+    /// Deleting from Neo4j alone leaves a permanently unreachable document
+    /// behind: `get` 404s while `search` keeps returning it.
+    pub async fn remove_decision_from_index(&self, decision_id: Uuid) -> Result<()> {
+        self.meili.delete_decision(&decision_id.to_string()).await
+    }
+
     pub async fn reindex_decisions(&self) -> Result<(usize, usize)> {
         let decisions = self.neo4j.get_all_decisions_with_task_id().await?;
         let total = decisions.len();
@@ -638,6 +673,38 @@ impl PlanManager {
         self.neo4j.get_project_slug_for_plan(plan_id).await
     }
 
+    /// Turn search hits into real decisions by reading them back from the graph.
+    ///
+    /// The search index only carries description/rationale/agent/timestamp. The
+    /// previous code filled the rest with defaults — `alternatives: vec![]`,
+    /// `chosen_option: None` and, worst of all, a hardcoded
+    /// `DecisionStatus::Accepted`. A superseded or deprecated decision therefore
+    /// came back through search looking like current, accepted architecture.
+    ///
+    /// Hits whose node no longer exists are dropped rather than invented: a
+    /// decision deleted from the graph must not survive in results.
+    async fn hydrate_decisions(
+        &self,
+        docs: Vec<DecisionDocument>,
+    ) -> Vec<DecisionNode> {
+        let mut out = Vec::with_capacity(docs.len());
+        for doc in docs {
+            let Ok(id) = doc.id.parse::<Uuid>() else {
+                continue;
+            };
+            match self.neo4j.get_decision(id).await {
+                Ok(Some(decision)) => out.push(decision),
+                Ok(None) => {
+                    tracing::debug!(decision_id = %id, "Stale decision in search index");
+                }
+                Err(e) => {
+                    tracing::warn!(decision_id = %id, error = %e, "Failed to hydrate decision");
+                }
+            }
+        }
+        out
+    }
+
     pub async fn search_decisions(
         &self,
         query: &str,
@@ -649,25 +716,7 @@ impl PlanManager {
             .search_decisions_in_project(query, limit, project_slug)
             .await?;
 
-        // Convert documents to nodes
-        let decisions = docs
-            .into_iter()
-            .map(|doc| DecisionNode {
-                id: doc.id.parse().unwrap_or_else(|_| Uuid::new_v4()),
-                description: doc.description,
-                rationale: doc.rationale,
-                alternatives: vec![],
-                chosen_option: None,
-                decided_by: doc.agent,
-                decided_at: doc.timestamp.parse().unwrap_or_else(|_| chrono::Utc::now()),
-                status: DecisionStatus::Accepted,
-                embedding: None,
-                embedding_model: None,
-                scar_intensity: 0.0,
-            })
-            .collect();
-
-        Ok(decisions)
+        Ok(self.hydrate_decisions(docs).await)
     }
 
     /// Search decisions across multiple projects (workspace-level).
@@ -682,24 +731,7 @@ impl PlanManager {
             .search_decisions_in_projects(query, limit, project_slugs)
             .await?;
 
-        let decisions = docs
-            .into_iter()
-            .map(|doc| DecisionNode {
-                id: doc.id.parse().unwrap_or_else(|_| Uuid::new_v4()),
-                description: doc.description,
-                rationale: doc.rationale,
-                alternatives: vec![],
-                chosen_option: None,
-                decided_by: doc.agent,
-                decided_at: doc.timestamp.parse().unwrap_or_else(|_| chrono::Utc::now()),
-                status: DecisionStatus::Accepted,
-                embedding: None,
-                embedding_model: None,
-                scar_intensity: 0.0,
-            })
-            .collect();
-
-        Ok(decisions)
+        Ok(self.hydrate_decisions(docs).await)
     }
 
     /// Semantic search for decisions using vector embeddings.
@@ -968,6 +1000,144 @@ mod tests {
     /// T2: affected_files must become (Task)-[:MODIFIES]->(File), otherwise
     /// get_task_details returns modifies_files: [] and the task prompt carries
     /// no information about the files the caller asked to change.
+    /// T14: search used to fabricate the fields the index does not carry —
+    /// alternatives, chosen_option, and a hardcoded status: Accepted. A
+    /// superseded decision therefore read as current architecture.
+    #[tokio::test]
+    async fn test_search_decisions_returns_real_status_and_fields() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+        let task = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("T".to_string()),
+                    description: "Task".to_string(),
+                    priority: Some(1),
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let decision = pm
+            .add_decision(
+                task.id,
+                CreateDecisionRequest {
+                    description: "ZQXTEST adopt ULID for identifiers".to_string(),
+                    rationale: "ordering".to_string(),
+                    alternatives: Some(vec!["uuidv4".to_string(), "snowflake".to_string()]),
+                    chosen_option: Some("ULID".to_string()),
+                    run_id: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        // Move it away from the default status.
+        pm.neo4j
+            .update_decision(
+                decision.id,
+                None,
+                None,
+                None,
+                Some(DecisionStatus::Superseded),
+            )
+            .await
+            .unwrap();
+
+        let hits = pm.search_decisions("ZQXTEST", 10, None).await.unwrap();
+        let found = hits
+            .iter()
+            .find(|d| d.id == decision.id)
+            .expect("decision should be searchable");
+
+        assert_eq!(
+            found.status,
+            DecisionStatus::Superseded,
+            "search must report the real status, not a hardcoded Accepted"
+        );
+        assert_eq!(found.alternatives, vec!["uuidv4", "snowflake"]);
+        assert_eq!(found.chosen_option.as_deref(), Some("ULID"));
+    }
+
+    /// A decision removed from the graph must not survive in search results.
+    #[tokio::test]
+    async fn test_search_decisions_drops_stale_index_entries() {
+        let pm = create_plan_manager();
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: None,
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+        let task = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("T".to_string()),
+                    description: "Task".to_string(),
+                    priority: Some(1),
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+        let decision = pm
+            .add_decision(
+                task.id,
+                CreateDecisionRequest {
+                    description: "ZQXGHOST phantom decision".to_string(),
+                    rationale: "r".to_string(),
+                    alternatives: None,
+                    chosen_option: None,
+                    run_id: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        // Delete from the graph only, leaving the index entry behind.
+        pm.neo4j.delete_decision(decision.id).await.unwrap();
+
+        let hits = pm.search_decisions("ZQXGHOST", 10, None).await.unwrap();
+        assert!(
+            !hits.iter().any(|d| d.id == decision.id),
+            "a decision deleted from the graph must not survive in search"
+        );
+    }
+
     #[tokio::test]
     async fn test_add_task_materialises_affected_files_as_modifies() {
         let pm = create_plan_manager();

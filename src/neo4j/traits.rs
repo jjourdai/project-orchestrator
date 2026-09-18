@@ -996,6 +996,11 @@ pub trait GraphStore: Send + Sync {
     async fn get_decision_embedding(&self, decision_id: Uuid) -> Result<Option<Vec<f32>>>;
 
     /// Get all decisions with their linked task_id (for MeiliSearch reindex)
+    async fn get_decision_with_task_id(
+        &self,
+        decision_id: Uuid,
+    ) -> Result<Option<(DecisionNode, Uuid)>>;
+
     async fn get_all_decisions_with_task_id(&self) -> Result<Vec<(DecisionNode, Uuid)>>;
 
     /// Get all Decision IDs that have no embedding yet (for backfill)
