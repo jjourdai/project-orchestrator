@@ -2140,7 +2140,16 @@ impl Neo4jClient {
             CALL {
                 WITH rel
                 MATCH (s:Struct {name: rel.struct_name, file_path: rel.struct_file})
-                MATCH (iface:Trait {name: rel.iface_name, project_id: rel.project_id})
+                // An "interface" is only a Trait node in languages that have a
+                // distinct construct (Java, TS, PHP, Kotlin, Swift). In Python,
+                // Ruby and any mixin-style language it is an ordinary CLASS, so
+                // matching Trait alone silently produced no relation at all:
+                // `class User(BaseEntity, Serializable)` linked BaseEntity via
+                // EXTENDS and dropped Serializable entirely.
+                OPTIONAL MATCH (t:Trait {name: rel.iface_name, project_id: rel.project_id})
+                OPTIONAL MATCH (c:Struct {name: rel.iface_name, file_path: rel.struct_file})
+                WITH s, coalesce(t, c) AS iface
+                WHERE iface IS NOT NULL AND elementId(iface) <> elementId(s)
                 WITH s, iface LIMIT 1
                 MERGE (s)-[:IMPLEMENTS]->(iface)
             }
