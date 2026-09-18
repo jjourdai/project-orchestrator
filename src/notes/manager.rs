@@ -907,7 +907,7 @@ impl NoteManager {
         query: &str,
         filters: &NoteFilters,
     ) -> Result<Vec<NoteSearchHit>> {
-        let project_slug = filters.search.as_deref(); // This is a simplification
+        let project_slug = filters.project_slug.as_deref();
         let note_type = filters
             .note_type
             .as_ref()

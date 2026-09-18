@@ -89,6 +89,7 @@ impl PlanManager {
                     constraint_req.constraint_type,
                     constraint_req.description,
                     constraint_req.enforced_by,
+                    constraint_req.severity,
                 );
                 self.add_constraint(plan.id, &constraint).await?;
             }
@@ -845,11 +846,13 @@ mod tests {
                     constraint_type: ConstraintType::Performance,
                     description: "Response time under 100ms".to_string(),
                     enforced_by: Some("benchmark".to_string()),
+                    severity: Some(crate::neo4j::models::ConstraintSeverity::Must),
                 },
                 CreateConstraintRequest {
                     constraint_type: ConstraintType::Security,
                     description: "Sanitize all user input".to_string(),
                     enforced_by: None,
+                    severity: None,
                 },
             ]),
         };
@@ -2083,6 +2086,7 @@ mod tests {
                         constraint_type: ConstraintType::Style,
                         description: "Follow Rust conventions".to_string(),
                         enforced_by: Some("rustfmt".to_string()),
+                        severity: None,
                     }]),
                 },
                 "architect",

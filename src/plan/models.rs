@@ -1,8 +1,8 @@
 //! Plan-related models and DTOs
 
 use crate::neo4j::models::{
-    ConstraintNode, ConstraintType, DecisionNode, DecisionStatus, PlanNode, PlanStatus, StepNode,
-    StepStatus, TaskNode, TaskStatus,
+    ConstraintNode, ConstraintSeverity, ConstraintType, DecisionNode, DecisionStatus, PlanNode,
+    PlanStatus, StepNode, StepStatus, TaskNode, TaskStatus,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,8 @@ pub struct CreateConstraintRequest {
     pub constraint_type: ConstraintType,
     pub description: String,
     pub enforced_by: Option<String>,
+    #[serde(default)]
+    pub severity: Option<ConstraintSeverity>,
 }
 
 /// Request to update a plan (title, description, priority)
@@ -118,6 +120,8 @@ pub struct AddConstraintRequest {
     pub constraint_type: ConstraintType,
     pub description: String,
     pub enforced_by: Option<String>,
+    #[serde(default)]
+    pub severity: Option<ConstraintSeverity>,
 }
 
 /// Request to record a decision
@@ -469,12 +473,14 @@ impl ConstraintNode {
         constraint_type: ConstraintType,
         description: String,
         enforced_by: Option<String>,
+        severity: Option<ConstraintSeverity>,
     ) -> Self {
         Self {
             id: Uuid::new_v4(),
             constraint_type,
             description,
             enforced_by,
+            severity,
         }
     }
 }
@@ -725,6 +731,7 @@ mod tests {
             ConstraintType::Security,
             "Must sanitize user input".to_string(),
             Some("clippy::security".to_string()),
+            Some(ConstraintSeverity::Must),
         );
 
         assert_eq!(constraint.constraint_type, ConstraintType::Security);
@@ -737,6 +744,7 @@ mod tests {
         let constraint = ConstraintNode::new(
             ConstraintType::Performance,
             "Response time under 100ms".to_string(),
+            None,
             None,
         );
 
@@ -755,7 +763,7 @@ mod tests {
         ];
 
         for constraint_type in types {
-            let constraint = ConstraintNode::new(constraint_type.clone(), "test".to_string(), None);
+            let constraint = ConstraintNode::new(constraint_type.clone(), "test".to_string(), None, None);
             assert_eq!(constraint.constraint_type, constraint_type);
         }
     }
@@ -766,6 +774,7 @@ mod tests {
             ConstraintType::Style,
             "Follow Rust conventions".to_string(),
             Some("rustfmt".to_string()),
+            Some(ConstraintSeverity::Should),
         );
 
         let json = serde_json::to_string(&constraint).unwrap();

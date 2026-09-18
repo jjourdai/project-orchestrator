@@ -640,6 +640,49 @@ pub struct ConstraintNode {
     pub constraint_type: ConstraintType,
     pub description: String,
     pub enforced_by: Option<String>,
+    /// How binding the constraint is.
+    ///
+    /// The API and the MCP schema have always advertised this, but the field
+    /// did not exist, so the value was accepted and dropped — a "must" was
+    /// indistinguishable from a "nice_to_have". Optional so rows written before
+    /// this field existed still load.
+    #[serde(default)]
+    pub severity: Option<ConstraintSeverity>,
+}
+
+/// How binding a constraint is.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintSeverity {
+    Must,
+    Should,
+    NiceToHave,
+}
+
+impl std::fmt::Display for ConstraintSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ConstraintSeverity::Must => "must",
+            ConstraintSeverity::Should => "should",
+            ConstraintSeverity::NiceToHave => "nice_to_have",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl std::str::FromStr for ConstraintSeverity {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "must" => Ok(ConstraintSeverity::Must),
+            "should" => Ok(ConstraintSeverity::Should),
+            "nice_to_have" | "nicetohave" | "nice-to-have" => Ok(ConstraintSeverity::NiceToHave),
+            other => Err(format!(
+                "Invalid severity '{}'. Expected: must, should, nice_to_have",
+                other
+            )),
+        }
+    }
 }
 
 /// Type of constraint

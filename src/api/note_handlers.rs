@@ -44,24 +44,22 @@ pub struct NotesListQuery {
 }
 
 impl NotesListQuery {
-    /// Convert to NoteFilters
-    pub fn to_note_filters(&self) -> NoteFilters {
-        NoteFilters {
-            note_type: self
-                .note_type
-                .as_ref()
-                .and_then(|s| s.parse::<NoteType>().ok())
-                .map(|t| vec![t]),
-            status: self.status.as_ref().map(|s| {
-                s.split(',')
-                    .filter_map(|s| s.trim().parse::<NoteStatus>().ok())
-                    .collect()
-            }),
-            importance: self
-                .importance
-                .as_ref()
-                .and_then(|s| s.parse::<NoteImportance>().ok())
-                .map(|i| vec![i]),
+    /// Convert to NoteFilters, rejecting values that do not parse.
+    ///
+    /// Previously an unparseable value was swallowed, with two DIFFERENT silent
+    /// outcomes for the same class of mistake: a bad `note_type` produced None,
+    /// i.e. NO FILTER AT ALL, so the caller got every note back and read it as
+    /// "these all match"; a bad `status` produced Some(vec![]), which matches
+    /// nothing, so the caller got an empty list and read it as "none exist".
+    /// Both are worse than an error.
+    pub fn to_note_filters(&self) -> Result<NoteFilters, String> {
+        Ok(NoteFilters {
+            note_type: parse_csv_enum::<NoteType>(self.note_type.as_deref(), "note_type")?,
+            status: parse_csv_enum::<NoteStatus>(self.status.as_deref(), "status")?,
+            importance: parse_csv_enum::<NoteImportance>(
+                self.importance.as_deref(),
+                "importance",
+            )?,
             min_staleness: self.min_staleness,
             max_staleness: self.max_staleness,
             tags: self
@@ -69,14 +67,38 @@ impl NotesListQuery {
                 .as_ref()
                 .map(|t| t.split(',').map(|s| s.trim().to_string()).collect()),
             search: self.search_filter.search.clone(),
+            project_slug: None,
             limit: Some(self.pagination.validated_limit() as i64),
             offset: Some(self.pagination.offset as i64),
             global_only: self.global_only,
             scope_type: None,
             sort_by: self.pagination.sort_by.clone(),
             sort_order: Some(self.pagination.sort_order.clone()),
+        })
+    }
+}
+
+/// Parse a comma-separated list of enum values, failing on the first bad one.
+///
+/// Returning an error beats the two silent failure modes it replaces: dropping
+/// the filter entirely, or building an empty filter that matches nothing.
+fn parse_csv_enum<T: std::str::FromStr>(
+    raw: Option<&str>,
+    field: &str,
+) -> Result<Option<Vec<T>>, String> {
+    let Some(raw) = raw else { return Ok(None) };
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.parse::<T>() {
+            Ok(v) => out.push(v),
+            Err(_) => return Err(format!("Invalid {} value: '{}'", field, part)),
         }
     }
+    Ok(if out.is_empty() { None } else { Some(out) })
 }
 
 /// Query parameters for searching notes
@@ -160,7 +182,7 @@ pub async fn list_notes(
 ) -> Result<Json<PaginatedResponse<Note>>, AppError> {
     query.pagination.validate().map_err(AppError::BadRequest)?;
 
-    let filters = query.to_note_filters();
+    let filters = query.to_note_filters().map_err(AppError::BadRequest)?;
     let (notes, total) = state
         .orchestrator
         .note_manager()
@@ -183,7 +205,7 @@ pub async fn list_project_notes(
 ) -> Result<Json<PaginatedResponse<Note>>, AppError> {
     query.pagination.validate().map_err(AppError::BadRequest)?;
 
-    let filters = query.to_note_filters();
+    let filters = query.to_note_filters().map_err(AppError::BadRequest)?;
     let (notes, total) = state
         .orchestrator
         .note_manager()
@@ -430,7 +452,7 @@ pub async fn search_notes(
             .as_ref()
             .and_then(|s| s.parse::<NoteImportance>().ok())
             .map(|i| vec![i]),
-        search: query.project_slug.clone(),
+        project_slug: query.project_slug.clone(),
         limit: query.limit.map(|l| l as i64),
         ..Default::default()
     };

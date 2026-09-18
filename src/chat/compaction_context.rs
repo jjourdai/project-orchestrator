@@ -358,6 +358,7 @@ impl CompactionContextBuilder {
     /// Fetch critical notes (guidelines + gotchas with importance >= High).
     async fn fetch_critical_notes(&self, ctx: &mut CompactionContext, project_id: Option<Uuid>) {
         let filters = NoteFilters {
+            project_slug: None,
             status: Some(vec![NoteStatus::Active]),
             note_type: Some(vec![NoteType::Guideline, NoteType::Gotcha]),
             importance: Some(vec![NoteImportance::High, NoteImportance::Critical]),

@@ -1055,6 +1055,13 @@ pub struct NoteFilters {
     pub scope_type: Option<String>,
     /// Search in content
     pub search: Option<String>,
+    /// Scope results to one project (by slug).
+    ///
+    /// Previously the slug was smuggled through `search`, which is the
+    /// free-text CONTENT filter — so scoping a search silently added a bogus
+    /// substring condition instead, and the content filter could not be used
+    /// for its documented purpose at the same time.
+    pub project_slug: Option<String>,
     /// Minimum staleness score
     pub min_staleness: Option<f64>,
     /// Maximum staleness score

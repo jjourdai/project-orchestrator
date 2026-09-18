@@ -24,7 +24,8 @@ impl Neo4jClient {
                 id: $id,
                 constraint_type: $constraint_type,
                 description: $description,
-                enforced_by: $enforced_by
+                enforced_by: $enforced_by,
+                severity: $severity
             })
             CREATE (p)-[:CONSTRAINED_BY]->(c)
             "#,
@@ -39,6 +40,13 @@ impl Neo4jClient {
         .param(
             "enforced_by",
             constraint.enforced_by.clone().unwrap_or_default(),
+        )
+        .param(
+            "severity",
+            constraint
+                .severity
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
         );
 
         self.graph.run(q).await?;
@@ -72,6 +80,11 @@ impl Neo4jClient {
                     .get::<String>("enforced_by")
                     .ok()
                     .filter(|s| !s.is_empty()),
+                severity: node
+                    .get::<String>("severity")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| s.parse().ok()),
             });
         }
 
@@ -90,6 +103,7 @@ impl Neo4jClient {
                   -[:CONSTRAINED_BY]->(c:Constraint)
             RETURN c.id AS id, c.constraint_type AS constraint_type,
                    c.description AS description, c.enforced_by AS enforced_by,
+                   c.severity AS severity,
                    plan.id AS plan_id
             "#,
         )
@@ -121,6 +135,11 @@ impl Neo4jClient {
                         .get::<String>("enforced_by")
                         .ok()
                         .filter(|s| !s.is_empty()),
+                    severity: row
+                        .get::<String>("severity")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| s.parse().ok()),
                 },
                 plan_id,
             ));
@@ -154,6 +173,11 @@ impl Neo4jClient {
                     .get::<String>("enforced_by")
                     .ok()
                     .filter(|s| !s.is_empty()),
+                severity: node
+                    .get::<String>("severity")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| s.parse().ok()),
             }))
         } else {
             Ok(None)

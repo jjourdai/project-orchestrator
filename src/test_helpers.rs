@@ -459,6 +459,7 @@ pub fn test_constraint(constraint_type: ConstraintType, description: &str) -> Co
         constraint_type,
         description: description.to_string(),
         enforced_by: None,
+        severity: None,
     }
 }
 

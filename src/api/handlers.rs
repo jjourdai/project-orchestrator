@@ -2182,7 +2182,8 @@ pub async fn add_constraint(
     Path(plan_id): Path<Uuid>,
     Json(req): Json<AddConstraintRequest>,
 ) -> Result<Json<ConstraintNode>, AppError> {
-    let constraint = ConstraintNode::new(req.constraint_type, req.description, req.enforced_by);
+    let constraint =
+        ConstraintNode::new(req.constraint_type, req.description, req.enforced_by, req.severity);
     state
         .orchestrator
         .plan_manager()
