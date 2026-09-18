@@ -125,10 +125,13 @@ impl Neo4jClient {
             // this filter the sentinel is resurrected as Some(...) — surfacing as
             // 255, the Bolt INT8 0xFF read unsigned — so the field was NEVER None
             // and the 300s/1800s defaults in protocol::runner could never apply.
+            // Legacy rows may still carry the old sentinel in either of the two
+            // shapes it could take: -1 as written, or 255 as it read back and was
+            // sometimes re-persisted. Neither is a real timeout.
             state_timeout_secs: node
                 .get::<i64>("state_timeout_secs")
                 .ok()
-                .filter(|v| *v >= 0)
+                .filter(|v| *v >= 0 && *v != 255)
                 .map(|v| v as u64),
         })
     }
@@ -477,9 +480,23 @@ impl Neo4jClient {
                 .map(|v| serde_json::to_string(v).unwrap_or_default())
                 .unwrap_or_default(),
         )
+        // Store NULL, never a sentinel.
+        //
+        // Writing -1 for "no timeout" looked harmless but was not: neo4rs reads
+        // the Bolt INT8 0xFF back UNSIGNED, so -1 returned as 255. The field was
+        // therefore never None, the 300s/1800s defaults never applied, and every
+        // runner-managed state silently timed out after 4m15s. Worse, any code
+        // path that read-then-wrote the value MATERIALISED 255 into the graph as
+        // real data (10 states in the live database ended up that way).
+        //
+        // `SET x = null` removes the property in Cypher, so absence is expressed
+        // as absence and cannot be misread as a number.
         .param(
             "state_timeout_secs",
-            state.state_timeout_secs.map(|v| v as i64).unwrap_or(-1),
+            match state.state_timeout_secs {
+                Some(v) => neo4rs::BoltType::from(v as i64),
+                None => neo4rs::BoltType::Null(neo4rs::BoltNull),
+            },
         );
 
         self.graph
