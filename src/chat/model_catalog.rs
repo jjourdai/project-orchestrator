@@ -73,13 +73,19 @@ const CURATED_ORDER: &[(&str, &str, &str, &str)] = &[
         "claude-sonnet-5",
         "Sonnet 5",
         "bg-rose-500",
+        "Best balance of speed & intelligence",
+    ),
+    (
+        "claude-fable-5-1",
+        "Fable 5.1",
+        "bg-rose-400",
         "Most capable — demanding reasoning & long-horizon agentic work",
     ),
     (
         "claude-fable-5",
         "Fable 5",
-        "bg-rose-400",
-        "Previous generation — superseded by Sonnet 5",
+        "bg-rose-300",
+        "Legacy — superseded by Fable 5.1",
     ),
     (
         "claude-opus-4-8",
@@ -388,6 +394,9 @@ mod tests {
         assert_eq!(derive_short_label("claude-sonnet-4-5"), "Sonnet 4.5");
         assert_eq!(derive_short_label("claude-opus-4-8"), "Opus 4.8");
         assert_eq!(derive_short_label("claude-haiku-4-5"), "Haiku 4.5");
+        // Two trailing numeric segments group into one dotted version, so a
+        // point release renders correctly even before anyone curates it.
+        assert_eq!(derive_short_label("claude-fable-5-1"), "Fable 5.1");
     }
 
     #[test]
@@ -411,6 +420,16 @@ mod tests {
         assert!(fable.is_some());
         assert_eq!(fable.unwrap().short_label, "Fable 5");
         assert!(curated_lookup("claude-sonnet-5").is_some());
+
+        // Fable 5.1 is a SEPARATE id, not a rename of Fable 5 — both stay
+        // selectable, and the prefix overlap must not collapse them.
+        let fable_51 = curated_lookup("claude-fable-5-1").expect("fable 5.1 curated");
+        assert_eq!(fable_51.short_label, "Fable 5.1");
+        assert_eq!(fable_51.full_label, "Claude Fable 5.1");
+        assert_ne!(
+            curated_lookup("claude-fable-5").unwrap().short_label,
+            fable_51.short_label
+        );
     }
 
     #[test]
@@ -419,7 +438,8 @@ mod tests {
         assert!(!models.is_empty());
         assert_eq!(models[0].id, "claude-opus-5");
         assert_eq!(models[1].id, "claude-sonnet-5");
-        assert_eq!(models[2].id, "claude-fable-5");
+        assert_eq!(models[2].id, "claude-fable-5-1");
+        assert_eq!(models[3].id, "claude-fable-5");
     }
 
     #[test]
