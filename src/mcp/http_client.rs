@@ -283,6 +283,23 @@ pub fn extract_id(args: &Value, field: &str) -> Result<String> {
     Ok(value)
 }
 
+/// Extract a required UUID accepting several argument names.
+///
+/// The published tool schema and the handlers had drifted apart on a number of
+/// actions: the schema documented `from_id`/`to_id`/`component_id`/`resource_id`
+/// while the handler only ever read `id`/`depends_on_id`/`dep_id`, so calling
+/// those actions exactly as documented always failed. Accepting both keeps
+/// existing callers working while making the documented names authoritative
+/// (they are tried first).
+pub fn extract_id_aliased(args: &Value, names: &[&str]) -> Result<String> {
+    for name in names {
+        if args.get(*name).is_some() {
+            return extract_id(args, name);
+        }
+    }
+    anyhow::bail!("{} is required", names[0])
+}
+
 /// Extract an optional integer field from tool arguments.
 pub fn extract_optional_i64(args: &Value, field: &str) -> Option<i64> {
     args.get(field).and_then(|v| v.as_i64())

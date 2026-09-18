@@ -7,7 +7,9 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-use super::http_client::{extract_id, extract_optional_string, extract_string, McpHttpClient};
+use super::http_client::{
+    extract_id, extract_id_aliased, extract_optional_string, extract_string, McpHttpClient,
+};
 use crate::graph::models::profile_by_name;
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 
@@ -3412,10 +3414,15 @@ impl ToolHandler {
             }
 
             "link_resource_to_project" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id_aliased(args, &["resource_id", "id"])?;
                 let project_id = extract_id(args, "project_id")?;
-                let link_type = extract_string(args, "link_type")?;
-                let body = json!({"project_id": project_id, "link_type": link_type});
+                // The API field is `relation` (workspace_handlers::LinkResourceRequest),
+                // not `link_type`; sending link_type produced a 422 even once the
+                // id was accepted. Accept either spelling from callers.
+                let relation = extract_optional_string(args, "relation")
+                    .or_else(|| extract_optional_string(args, "link_type"))
+                    .unwrap_or_else(|| "uses".to_string());
+                let body = json!({"project_id": project_id, "relation": relation});
                 let result = http
                     .post(&format!("/api/resources/{}/projects", id), &body)
                     .await?;
@@ -3501,9 +3508,10 @@ impl ToolHandler {
             }
 
             "add_component_dependency" => {
-                let id = extract_id(args, "id")?;
-                let depends_on_id = extract_id(args, "depends_on_id")?;
+                let id = extract_id_aliased(args, &["from_id", "id"])?;
+                let depends_on_id = extract_id_aliased(args, &["to_id", "depends_on_id"])?;
                 let mut body = json!({"depends_on_id": depends_on_id});
+
                 if let Some(v) = args.get("protocol") {
                     body["protocol"] = v.clone();
                 }
@@ -3521,8 +3529,8 @@ impl ToolHandler {
             }
 
             "remove_component_dependency" => {
-                let id = extract_id(args, "id")?;
-                let dep_id = extract_id(args, "dep_id")?;
+                let id = extract_id_aliased(args, &["from_id", "id"])?;
+                let dep_id = extract_id_aliased(args, &["to_id", "dep_id"])?;
                 let result = http
                     .delete(&format!("/api/components/{}/dependencies/{}", id, dep_id))
                     .await?;
@@ -3534,7 +3542,7 @@ impl ToolHandler {
             }
 
             "map_component_to_project" => {
-                let id = extract_id(args, "id")?;
+                let id = extract_id_aliased(args, &["component_id", "id"])?;
                 let project_id = extract_id(args, "project_id")?;
                 let body = json!({"project_id": project_id});
                 let result = http
@@ -5676,7 +5684,7 @@ impl ToolHandler {
                 let consent = extract_string(args, "consent")?;
                 let body = json!({"consent": consent});
                 let result = http
-                    .put(&format!("/api/notes/{}/consent", note_id), &body)
+                    .put(&format!("/api/notes/{}/sharing/consent", note_id), &body)
                     .await?;
                 Ok(Some(result))
             }

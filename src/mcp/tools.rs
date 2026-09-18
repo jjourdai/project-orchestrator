@@ -776,7 +776,10 @@ fn component_tool() -> ToolDefinition {
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags (create/update)"},
                 "from_id": {"type": "string", "description": "Source component UUID (add_dependency/remove_dependency)"},
                 "to_id": {"type": "string", "description": "Target component UUID (add_dependency/remove_dependency)"},
-                "dependency_type": {"type": "string", "description": "Dependency type (add_dependency)"},
+                "depends_on_id": {"type": "string", "description": "Target component UUID (add_dependency) — alias: to_id"},
+                "dep_id": {"type": "string", "description": "Target component UUID (remove_dependency) — alias: to_id"},
+                "protocol": {"type": "string", "description": "Transport/protocol of the dependency (add_dependency), e.g. http, grpc"},
+                "required": {"type": "boolean", "description": "Whether the dependency is required (add_dependency, default true)"},
                 "component_id": {"type": "string", "description": "Component UUID (map_to_project)"},
                 "project_id": {"type": "string", "description": "Project UUID (map_to_project)"}
             })),
