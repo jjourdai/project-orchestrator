@@ -278,9 +278,17 @@ async fn fire_transition_inner(
         }
     };
 
-    // 4. Check guard (if any) — for now, guards are informational only
-    // Future: evaluate guard expressions against run context
-    // if let Some(guard) = &transition.guard { ... }
+    // 4. Guards are DOCUMENTATION ONLY and are deliberately not evaluated.
+    //
+    // There is no expression language and no typed run context to evaluate one
+    // against, so a guard cannot block a transition. The MCP schema and the
+    // prompt docs now say this explicitly — they previously claimed transitions
+    // "evaluate guards", which made a guard that guards nothing read as a
+    // working safety check.
+    //
+    // Implementing real guards is a feature, not a bug fix: it needs an
+    // expression grammar, a run context to evaluate against, and a decision
+    // about what a failed evaluation should do.
 
     // 5. Resolve target state name
     let states = store.get_protocol_states(run.protocol_id).await?;

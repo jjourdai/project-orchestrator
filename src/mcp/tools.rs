@@ -1099,7 +1099,7 @@ fn protocol_tool() -> ToolDefinition {
                 "from_state": {"type": "string", "description": "Source state UUID (add_transition)"},
                 "to_state": {"type": "string", "description": "Target state UUID (add_transition)"},
                 "trigger": {"type": "string", "description": "Transition trigger (add_transition/transition)"},
-                "guard": {"type": "string", "description": "Optional guard condition (add_transition)"},
+                "guard": {"type": "string", "description": "Optional guard condition (add_transition) — DOCUMENTATION ONLY: stored and shown, never evaluated, so it does not block a transition"},
                 "run_id": {"type": "string", "description": "Protocol run UUID (get_run/transition/cancel_run/fail_run/report_progress/delete_run)"},
                 "state_name": {"type": "string", "description": "Current state name (report_progress)"},
                 "sub_action": {"type": "string", "description": "Current sub-action being executed (report_progress)"},

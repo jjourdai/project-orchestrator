@@ -1099,7 +1099,7 @@ Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, d
 | list_transitions | `protocol_id` (req) | List transitions for protocol |
 | link_to_skill | `protocol_id` (req), `skill_id` (req) | Link protocol to a skill |
 | start_run | `protocol_id` (req), `plan_id`, `task_id` | Start a new protocol run (creates ProtocolRun in entry state) |
-| transition | `run_id` (req), `trigger` (req) | Fire a transition on a running protocol (evaluates guards, advances state) |
+| transition | `run_id` (req), `trigger` (req) | Fire a transition on a running protocol (advances state; guards are documentation only, not evaluated) |
 | get_run | `run_id` (req) | Get a protocol run with current state, states_visited history, status |
 | list_runs | `protocol_id` (req), `status` | List runs for a protocol (filter by status: running/completed/failed/cancelled) |
 | cancel_run | `run_id` (req) | Cancel a running protocol run |

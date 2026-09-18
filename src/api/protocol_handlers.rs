@@ -38,21 +38,29 @@ fn validate_transition_state_types(
     from_state_id: Uuid,
     to_state_id: Uuid,
 ) -> Result<(), String> {
-    if let Some(from_s) = states.iter().find(|s| s.id == from_state_id) {
-        if from_s.state_type == crate::protocol::StateType::Terminal {
-            return Err(format!(
-                "Cannot add transition from terminal state '{}'",
-                from_s.name
-            ));
-        }
+    // Unknown ids must be rejected, not skipped. Using `if let Some(..)` alone
+    // let a transition between two non-existent states through on the create
+    // path, while add_transition correctly 400s on the same input.
+    let from_s = states
+        .iter()
+        .find(|s| s.id == from_state_id)
+        .ok_or_else(|| format!("from_state {} not found in protocol", from_state_id))?;
+    if from_s.state_type == crate::protocol::StateType::Terminal {
+        return Err(format!(
+            "Cannot add transition from terminal state '{}'",
+            from_s.name
+        ));
     }
-    if let Some(to_s) = states.iter().find(|s| s.id == to_state_id) {
-        if to_s.state_type == crate::protocol::StateType::Start {
-            return Err(format!(
-                "Cannot add transition to start state '{}'",
-                to_s.name
-            ));
-        }
+
+    let to_s = states
+        .iter()
+        .find(|s| s.id == to_state_id)
+        .ok_or_else(|| format!("to_state {} not found in protocol", to_state_id))?;
+    if to_s.state_type == crate::protocol::StateType::Start {
+        return Err(format!(
+            "Cannot add transition to start state '{}'",
+            to_s.name
+        ));
     }
     Ok(())
 }

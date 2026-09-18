@@ -558,6 +558,41 @@ impl Neo4jClient {
             return Ok(false);
         }
 
+        // Refuse to delete the entry state. from_state/to_state and
+        // entry_state/terminal_states are stored as string PROPERTIES, so
+        // DETACH DELETE cannot clean them up: removing the entry state left a
+        // protocol whose start_run 404s forever, with no way to reassign it
+        // (protocol update does not accept entry_state).
+        let entry_q = query(
+            r#"
+            MATCH (p:Protocol {entry_state: $id})
+            RETURN p.id AS protocol_id
+            LIMIT 1
+            "#,
+        )
+        .param("id", state_id.to_string());
+        let mut entry_result = self.graph.execute(entry_q).await?;
+        if entry_result.next().await?.is_some() {
+            anyhow::bail!(
+                "State {} is the protocol entry state; deleting it would make the \
+                 protocol unrunnable. Point entry_state elsewhere first.",
+                state_id
+            );
+        }
+
+        // Cascade to transitions referencing this state. They reference it by
+        // string property, not by relationship, so DETACH DELETE never touches
+        // them and they would dangle.
+        let cascade_q = query(
+            r#"
+            MATCH (t:ProtocolTransition)
+            WHERE t.from_state = $id OR t.to_state = $id
+            DETACH DELETE t
+            "#,
+        )
+        .param("id", state_id.to_string());
+        self.graph.run(cascade_q).await?;
+
         let delete_q = query(
             r#"
             MATCH (s:ProtocolState {id: $id})
