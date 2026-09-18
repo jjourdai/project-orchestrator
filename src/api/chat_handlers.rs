@@ -1181,6 +1181,180 @@ pub async fn associate_session(
     })))
 }
 
+// ============================================================================
+// Attachments (plan 9fc118a3) — images pasted or dropped into the composer
+// ============================================================================
+//
+// The agent receives images as ABSOLUTE PATHS injected into the message text,
+// which it opens with its Read tool (Read renders images natively). It does
+// NOT receive base64 content blocks: `nexus-claude` builds the CLI stdin frame
+// as {"role":"user","content":"<string>"} — a plain string, never a block
+// array — so inline image blocks would require forking that pinned crate.
+//
+// This endpoint exists for the surfaces where the browser only hands us BYTES
+// and no path: clipboard paste (both desktop and web) and web drag-and-drop.
+// The Tauri desktop drop path never calls it — Tauri hands the frontend the
+// real absolute path directly, so there is nothing to upload.
+
+/// Hard cap on a single attachment. Retina screenshots run 1–5 MB; the cap is
+/// what stops an accidental drop of a video from being written to disk.
+///
+/// NOTE: axum's own default body limit is 2 MB, which is BELOW a typical
+/// retina screenshot. The route must carry an explicit `DefaultBodyLimit`
+/// matching this constant or large pastes fail with 413 before the handler
+/// ever runs.
+pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+pub struct AttachmentQuery {
+    /// Original client-side filename — used for DISPLAY ONLY and to recover an
+    /// extension. Never used to build the on-disk path.
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttachmentResponse {
+    /// Absolute path of the stored file — this is what gets injected into the
+    /// message text for the agent to Read.
+    pub path: String,
+    /// Original filename, for the chip label in the composer.
+    pub filename: String,
+    pub bytes: usize,
+}
+
+/// Resolve the on-disk extension for an upload, from the declared content type
+/// first and the client filename second.
+///
+/// Returning `None` REJECTS the upload: this whitelist is the only thing
+/// standing between the endpoint and "write arbitrary bytes to an arbitrary
+/// extension in the user's home directory".
+fn attachment_extension(
+    content_type: Option<&str>,
+    filename: Option<&str>,
+) -> Option<&'static str> {
+    // Content type wins — it is what the browser actually read off the
+    // clipboard, whereas the filename is often absent on a paste.
+    if let Some(ct) = content_type {
+        let ct = ct
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        match ct.as_str() {
+            "image/png" => return Some("png"),
+            "image/jpeg" | "image/jpg" => return Some("jpg"),
+            "image/webp" => return Some("webp"),
+            "image/gif" => return Some("gif"),
+            // An explicitly declared non-image type is a rejection, not a
+            // reason to fall through to the (attacker-controlled) filename.
+            other if !other.is_empty() && other != "application/octet-stream" => return None,
+            _ => {}
+        }
+    }
+
+    let ext = filename?.rsplit('.').next()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("png"),
+        "jpg" | "jpeg" => Some("jpg"),
+        "webp" => Some("webp"),
+        "gif" => Some("gif"),
+        _ => None,
+    }
+}
+
+/// Directory holding one session's attachments.
+fn attachments_dir(session_id: &Uuid) -> Result<std::path::PathBuf, AppError> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Cannot determine home directory")))?;
+    Ok(home
+        .join(".project-orchestrator")
+        .join("attachments")
+        .join(session_id.to_string()))
+}
+
+/// Label shown on the composer chip: the client filename reduced to its
+/// basename, falling back to the stored name.
+///
+/// Purely cosmetic — the on-disk path is built from a fresh UUID — but it is
+/// also the reason a hostile `filename` is inert: any directory component is
+/// dropped here, and nothing downstream ever joins this string onto a path.
+fn display_filename(client_filename: Option<&str>, stored_name: &str) -> String {
+    client_filename
+        .and_then(|f| f.rsplit(['/', '\\']).next())
+        .map(str::trim)
+        .filter(|f| !f.is_empty() && *f != "." && *f != "..")
+        .unwrap_or(stored_name)
+        .to_string()
+}
+
+/// POST /api/chat/sessions/{id}/attachments — Store an image and return its
+/// absolute path.
+///
+/// The body is the RAW image bytes (`axum::body::Bytes`), not multipart and
+/// not base64: no new dependency, and none of base64's 33% inflation on a
+/// path that carries multi-megabyte screenshots.
+///
+/// The on-disk name is always `<uuid>.<whitelisted ext>`. The client filename
+/// is echoed back for display but never touches the path, so a `filename` of
+/// `../../.ssh/authorized_keys` cannot escape the session directory.
+pub async fn upload_attachment(
+    State(_state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+    Query(query): Query<AttachmentQuery>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<AttachmentResponse>, AppError> {
+    if body.is_empty() {
+        return Err(AppError::BadRequest("Empty attachment body".to_string()));
+    }
+    if body.len() > MAX_ATTACHMENT_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "Attachment too large: {} bytes (max {})",
+            body.len(),
+            MAX_ATTACHMENT_BYTES
+        )));
+    }
+
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+
+    let ext = attachment_extension(content_type, query.filename.as_deref()).ok_or_else(|| {
+        AppError::BadRequest(
+            "Unsupported attachment type — expected image/png, image/jpeg, image/webp or image/gif"
+                .to_string(),
+        )
+    })?;
+
+    let dir = attachments_dir(&session_id)?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Cannot create attachments dir: {e}")))?;
+
+    let stored_name = format!("{}.{}", Uuid::new_v4(), ext);
+    let path = dir.join(&stored_name);
+
+    tokio::fs::write(&path, &body)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Cannot write attachment: {e}")))?;
+
+    let filename = display_filename(query.filename.as_deref(), &stored_name);
+
+    tracing::debug!(
+        session_id = %session_id,
+        path = %path.display(),
+        bytes = body.len(),
+        "Stored chat attachment"
+    );
+
+    Ok(Json(AttachmentResponse {
+        path: path.to_string_lossy().to_string(),
+        filename,
+        bytes: body.len(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1886,5 +2060,102 @@ mod tests {
         assert_eq!(allowed.len(), 1);
         assert_eq!(allowed[0], "mcp__project-orchestrator__*");
         assert_eq!(json["disallowed_tools"].as_array().unwrap().len(), 0);
+    }
+
+    // ========================================================================
+    // Attachments (plan 9fc118a3)
+    // ========================================================================
+
+    #[test]
+    fn attachment_extension_prefers_content_type() {
+        assert_eq!(attachment_extension(Some("image/png"), None), Some("png"));
+        assert_eq!(
+            attachment_extension(Some("image/jpeg; charset=binary"), None),
+            Some("jpg")
+        );
+        assert_eq!(attachment_extension(Some("IMAGE/WEBP"), None), Some("webp"));
+        assert_eq!(attachment_extension(Some("image/gif"), None), Some("gif"));
+    }
+
+    #[test]
+    fn attachment_extension_falls_back_to_filename() {
+        // Clipboard pastes often carry no usable filename, and some browsers
+        // send octet-stream instead of the real image type — the filename is
+        // the fallback for exactly that case.
+        assert_eq!(attachment_extension(None, Some("shot.PNG")), Some("png"));
+        assert_eq!(
+            attachment_extension(Some("application/octet-stream"), Some("a.webp")),
+            Some("webp")
+        );
+        assert_eq!(attachment_extension(None, Some("photo.jpeg")), Some("jpg"));
+    }
+
+    #[test]
+    fn attachment_extension_rejects_non_images() {
+        // A DECLARED non-image type must reject outright, never fall through to
+        // the attacker-controlled filename: otherwise `Content-Type: text/html`
+        // + `filename=x.png` would write an HTML payload under a .png name.
+        assert_eq!(attachment_extension(Some("text/html"), Some("x.png")), None);
+        assert_eq!(
+            attachment_extension(Some("application/x-sh"), Some("x.png")),
+            None
+        );
+        assert_eq!(attachment_extension(None, Some("evil.svg")), None);
+        assert_eq!(attachment_extension(None, Some("noextension")), None);
+        assert_eq!(attachment_extension(None, None), None);
+    }
+
+    #[test]
+    fn display_filename_strips_directory_components() {
+        // The on-disk path is UUID-based, so this is cosmetic — but it is the
+        // assertion that a traversal-shaped filename never survives as a path.
+        assert_eq!(
+            display_filename(Some("../../.ssh/authorized_keys"), "stored.png"),
+            "authorized_keys"
+        );
+        assert_eq!(
+            display_filename(Some("C:\\Users\\me\\shot.png"), "stored.png"),
+            "shot.png"
+        );
+        assert_eq!(display_filename(Some(".."), "stored.png"), "stored.png");
+        assert_eq!(display_filename(Some("   "), "stored.png"), "stored.png");
+        assert_eq!(display_filename(None, "stored.png"), "stored.png");
+        assert_eq!(display_filename(Some("shot.png"), "stored.png"), "shot.png");
+    }
+
+    /// Route-level: the endpoint is wired and rejects a non-image BEFORE
+    /// touching the filesystem. Deliberately asserts the REJECTION path so the
+    /// test suite never writes into the developer's real home directory (the
+    /// handler stores under ~/.project-orchestrator/attachments/).
+    #[tokio::test]
+    async fn test_upload_attachment_rejects_non_image() {
+        let app = test_app().await;
+        let session_id = Uuid::new_v4();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/chat/sessions/{}/attachments?filename=payload.png",
+                session_id
+            ))
+            .header("content-type", "text/html")
+            .header("authorization", test_bearer_token())
+            .body(Body::from("<script>not an image</script>"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        // Not 404: proves the route is registered. 400: proves the whitelist
+        // rejected a declared non-image even though the filename said .png.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn attachment_size_cap_exceeds_axum_default_body_limit() {
+        // Regression guard: axum's default body limit is 2 MiB, below a normal
+        // retina screenshot. The route carries an explicit DefaultBodyLimit of
+        // MAX_ATTACHMENT_BYTES; if someone lowers this constant under 2 MiB the
+        // explicit layer silently becomes the tighter one.
+        assert!(MAX_ATTACHMENT_BYTES > 2 * 1024 * 1024);
     }
 }
