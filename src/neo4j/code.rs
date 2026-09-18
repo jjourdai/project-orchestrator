@@ -3011,11 +3011,11 @@ impl Neo4jClient {
             let name: String = node.get("name")?;
             let is_async: bool = node.get("is_async").unwrap_or(false);
             let visibility: String = node.get("visibility").unwrap_or_default();
-            let is_public = visibility == "public";
+            let is_public = visibility_is_public(&visibility);
             let line: i64 = node.get("line_start").unwrap_or(0);
             let complexity: i64 = node.get("complexity").unwrap_or(1);
             let docstring: Option<String> = node.get("docstring").ok();
-            let params: Vec<String> = node.get("params").unwrap_or_default();
+            let params: Vec<String> = Self::decode_params(&node);
             let return_type: String = node.get("return_type").unwrap_or_default();
             let async_prefix = if is_async { "async " } else { "" };
             let signature = format!(
@@ -3044,6 +3044,15 @@ impl Neo4jClient {
         Ok(functions)
     }
 
+    /// Read and decode the `params` property of a Function node.
+    fn decode_params(node: &neo4rs::Node) -> Vec<String> {
+        match node.get::<String>("params") {
+            Ok(raw) => render_params(&raw),
+            // Tolerate rows written as a real list by any other path.
+            Err(_) => node.get::<Vec<String>>("params").unwrap_or_default(),
+        }
+    }
+
     /// Get struct summaries for a file
     pub async fn get_file_structs_summary(&self, path: &str) -> Result<Vec<StructSummaryNode>> {
         let q = query(
@@ -3062,7 +3071,7 @@ impl Neo4jClient {
             let node: neo4rs::Node = row.get("s")?;
             let name: String = node.get("name")?;
             let visibility: String = node.get("visibility").unwrap_or_default();
-            let is_public = visibility == "public";
+            let is_public = visibility_is_public(&visibility);
             let line: i64 = node.get("line_start").unwrap_or(0);
             let docstring: Option<String> = node.get("docstring").ok();
 
@@ -4517,5 +4526,99 @@ impl Neo4jClient {
         } else {
             Ok(0.0)
         }
+    }
+}
+
+// ============================================================================
+// Property decoding helpers
+//
+// The upsert paths write these two properties in a shape the readers used to
+// mis-parse. Both are decoded here so the write/read contract lives in one
+// place and is covered by round-trip tests.
+// ============================================================================
+
+/// Decode the `visibility` property written by the upsert paths.
+///
+/// Those write `format!("{:?}", visibility)`, i.e. the Debug rendering of the
+/// enum — "Public", capitalised. Comparing against a lowercase literal, as this
+/// code used to, never matched, so `is_public` was uniformly false (4672 public
+/// functions in the live graph were reported private). Accepting either casing
+/// repairs the rows already stored without a migration, and keeps working if
+/// the writer is ever normalised.
+fn visibility_is_public(raw: &str) -> bool {
+    raw.eq_ignore_ascii_case("public")
+}
+
+/// Render the `params` property written by the upsert paths.
+///
+/// Those write `serde_json::to_string(&func.params)` — a JSON STRING, not a
+/// Neo4j list. Reading it as `Vec<String>` was a type mismatch that
+/// `unwrap_or_default()` silently turned into an empty vec, so every signature
+/// lost its parameters. Returns rendered "name: type" fragments.
+fn render_params(raw: &str) -> Vec<String> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    match serde_json::from_str::<Vec<crate::neo4j::models::Parameter>>(raw) {
+        Ok(params) => params
+            .into_iter()
+            .map(|p| match p.type_name {
+                Some(t) => format!("{}: {}", p.name, t),
+                None => p.name,
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to decode Function.params JSON");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The writers emit Debug-formatted enum variants; these are the four
+    /// values actually present in the live graph.
+    #[test]
+    fn visibility_decodes_the_stored_debug_casing() {
+        assert!(visibility_is_public("Public"), "4672 rows are stored as \"Public\"");
+        assert!(!visibility_is_public("Private"));
+        assert!(!visibility_is_public("Crate"));
+        assert!(!visibility_is_public("Super"));
+        assert!(!visibility_is_public(""));
+        // Stays correct if the writer is ever normalised to lowercase.
+        assert!(visibility_is_public("public"));
+    }
+
+    /// Verbatim value read from the live graph for NoteManager::new.
+    #[test]
+    fn params_decode_from_the_stored_json_string() {
+        let stored = r#"[{"name":"neo4j","type_name":"Arc<dyn GraphStore>"},{"name":"meilisearch","type_name":"Arc<dyn SearchStore>"}]"#;
+        assert_eq!(
+            render_params(stored),
+            vec![
+                "neo4j: Arc<dyn GraphStore>".to_string(),
+                "meilisearch: Arc<dyn SearchStore>".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn params_handle_empty_untyped_and_malformed() {
+        assert!(render_params("").is_empty());
+        assert!(render_params("[]").is_empty());
+        assert_eq!(render_params(r#"[{"name":"self"}]"#), vec!["self".to_string()]);
+        // Malformed JSON degrades to empty rather than panicking.
+        assert!(render_params("not json").is_empty());
+    }
+
+    /// The defect this replaces: a JSON string read as Vec<String> yields the
+    /// Default (empty), which is why every signature rendered as `fn f()`.
+    #[test]
+    fn stored_params_are_not_a_plain_string_list() {
+        let stored = r#"[{"name":"neo4j","type_name":"Arc<dyn GraphStore>"}]"#;
+        assert!(serde_json::from_str::<Vec<String>>(stored).is_err());
+        assert!(!render_params(stored).is_empty());
     }
 }
