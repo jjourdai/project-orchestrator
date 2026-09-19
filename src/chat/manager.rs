@@ -1724,6 +1724,34 @@ impl ChatManager {
     ///
     /// Build the system prompt and return the set of note IDs included
     /// (from guidelines/gotchas) for deduplication with the enrichment pipeline.
+    /// Record what went into a session's system prompt, and what was cut.
+    ///
+    /// Best-effort: an unobservable composition is a regression, a failed
+    /// write is not a reason to refuse the session. But it is never silent —
+    /// `set_composition_report` reports whether a node actually matched, so a
+    /// write into the void is logged rather than mistaken for success.
+    pub(crate) async fn persist_composition_report(
+        &self,
+        session_id: uuid::Uuid,
+        report: &super::composition_report::CompositionReport,
+    ) {
+        let json = match serde_json::to_string(report) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!(error = %e, "Failed to serialize composition report");
+                return;
+            }
+        };
+        match self.graph.set_composition_report(session_id, &json).await {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                session_id = %session_id,
+                "Composition report matched no session node — it will not be observable"
+            ),
+            Err(e) => warn!(error = %e, "Failed to persist composition report"),
+        }
+    }
+
     pub async fn build_system_prompt(
         &self,
         project_slug: Option<&str>,
@@ -1731,7 +1759,11 @@ impl ChatManager {
         model: Option<&str>,
         session_id: Option<&str>,
         scaffolding_override: Option<u8>,
-    ) -> (String, std::collections::HashSet<String>) {
+    ) -> (
+        String,
+        std::collections::HashSet<String>,
+        Option<super::composition_report::CompositionReport>,
+    ) {
         use super::composer::{ComposerInput, FsmPromptComposer};
         use super::prompt::{context_to_markdown, fetch_project_context};
         use super::routing::HeuristicRouter;
@@ -1743,7 +1775,7 @@ impl ChatManager {
         // No project → compose with defaults (L0, no FSM, no dynamic context)
         let Some(slug) = project_slug else {
             let input = ComposerInput::default();
-            return (FsmPromptComposer::compose(&input), empty_ids);
+            return (FsmPromptComposer::compose(&input), empty_ids, None);
         };
 
         // Fetch raw context from Neo4j
@@ -1755,7 +1787,7 @@ impl ChatManager {
                     slug, e
                 );
                 let input = ComposerInput::default();
-                return (FsmPromptComposer::compose(&input), empty_ids);
+                return (FsmPromptComposer::compose(&input), empty_ids, None);
             }
         };
 
@@ -1955,35 +1987,18 @@ impl ChatManager {
         // Record what went into the prompt — and what did not. Best-effort:
         // an unobservable composition is a regression, a failed write is not
         // a reason to refuse the session.
-        if let Some(sid) = session_id {
-            if composition.is_truncated() {
-                warn!(
-                    session_id = %sid,
-                    truncated_chars = composition.truncated_chars,
-                    budget = composition.dynamic_budget_chars,
-                    sections = ?composition
-                        .all_dropped_sections()
-                        .iter()
-                        .map(|d| d.section.as_str())
-                        .collect::<Vec<_>>(),
-                    "System prompt context truncated"
-                );
-            }
-            // Awaited, not spawned: the `system_init` event reads this
-            // report back to fill its chips, and that event follows within
-            // milliseconds. A fire-and-forget write would leave the ordering
-            // to chance, and "it's fast enough in practice" is the reasoning
-            // that produced the bugs this report exists to expose.
-            if let Ok(uuid) = uuid::Uuid::parse_str(sid) {
-                match serde_json::to_string(&composition) {
-                    Ok(json) => {
-                        if let Err(e) = self.graph.set_composition_report(uuid, &json).await {
-                            warn!(error = %e, "Failed to persist composition report");
-                        }
-                    }
-                    Err(e) => warn!(error = %e, "Failed to serialize composition report"),
-                }
-            }
+        if composition.is_truncated() {
+            warn!(
+                session_id = ?session_id,
+                truncated_chars = composition.truncated_chars,
+                budget = composition.dynamic_budget_chars,
+                sections = ?composition
+                    .all_dropped_sections()
+                    .iter()
+                    .map(|d| d.section.as_str())
+                    .collect::<Vec<_>>(),
+                "System prompt context truncated"
+            );
         }
 
         // Emit routing decision to trajectory collector (fire-and-forget)
@@ -2053,7 +2068,7 @@ impl ChatManager {
             }
         }
 
-        (prompt, included_note_ids)
+        (prompt, included_note_ids, Some(composition))
     }
 
     /// Check if a session is currently active (subprocess alive)
@@ -2522,7 +2537,7 @@ impl ChatManager {
 
         // Build system prompt — runner-spawned agents get a dedicated autonomous
         // execution prompt; conversational sessions get the generic PO prompt.
-        let (system_prompt, _included_note_ids) =
+        let (system_prompt, _included_note_ids, composition_report) =
             if let Some(ref runner_ctx) = request.runner_context {
                 // Runner mode: use the runner system prompt (autonomous code execution)
                 let prompt_ctx = runner_ctx.to_prompt_context();
@@ -2532,7 +2547,7 @@ impl ChatManager {
                     scaffolding = runner_ctx.scaffolding_level,
                     "Using runner system prompt (autonomous code execution mode)"
                 );
-                (runner_prompt, std::collections::HashSet::new())
+                (runner_prompt, std::collections::HashSet::new(), None)
             } else {
                 // Conversational mode: use the generic PO system prompt with routing
                 let routing_message = if request.message.is_empty() {
@@ -2587,6 +2602,15 @@ impl ChatManager {
             .create_chat_session(&session_node)
             .await
             .context("Failed to persist chat session")?;
+
+        // Only now, once the node exists. The prompt is composed well before
+        // this point, and `MATCH (s:ChatSession {id: $id}) SET ...` against a
+        // node that does not exist yet matches nothing and returns Ok — so
+        // writing the report at composition time meant every new session
+        // silently had none, and only resumed sessions ever did.
+        if let Some(ref report) = composition_report {
+            self.persist_composition_report(session_id, report).await;
+        }
 
         // If this session was spawned by another, create the SPAWNED_BY relation in Neo4j
         // and extract protocol FSM context (run_id + state) for trajectory tagging.
@@ -5347,7 +5371,7 @@ impl ChatManager {
         }
 
         // Build options - with resume flag only if we have a cli_session_id
-        let (system_prompt, _included_note_ids) = self
+        let (system_prompt, _included_note_ids, composition_report) = self
             .build_system_prompt(
                 session_node.project_slug.as_deref(),
                 message,
@@ -5356,6 +5380,11 @@ impl ChatManager {
                 None,
             )
             .await;
+
+        // The session node already exists on this path.
+        if let Some(ref report) = composition_report {
+            self.persist_composition_report(uuid, report).await;
+        }
 
         // Create broadcast channel early so CompactionNotifier can use the sender
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
@@ -7326,7 +7355,7 @@ mod tests {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        let (prompt, note_ids) = manager
+        let (prompt, note_ids, _report) = manager
             .build_system_prompt(None, "test", None, None, None)
             .await;
         assert!(prompt.contains("Project Orchestrator"));
@@ -7342,7 +7371,7 @@ mod tests {
         state.neo4j.create_project(&project).await.unwrap();
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
-        let (prompt, _note_ids) = manager
+        let (prompt, _note_ids, _report) = manager
             .build_system_prompt(Some(&project.slug), "help me plan", None, None, None)
             .await;
 
@@ -8193,7 +8222,7 @@ mod tests {
             .unwrap();
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
-        let (prompt, _note_ids) = manager
+        let (prompt, _note_ids, _report) = manager
             .build_system_prompt(Some(&project.slug), "check the plan", None, None, None)
             .await;
 

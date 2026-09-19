@@ -2283,7 +2283,7 @@ impl GraphStore for Neo4jClient {
         self.update_chat_session_model(id, model).await
     }
 
-    async fn set_composition_report(&self, id: Uuid, report_json: &str) -> anyhow::Result<()> {
+    async fn set_composition_report(&self, id: Uuid, report_json: &str) -> anyhow::Result<bool> {
         self.set_composition_report(id, report_json).await
     }
 

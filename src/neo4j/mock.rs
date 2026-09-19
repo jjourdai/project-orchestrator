@@ -6959,10 +6959,15 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn set_composition_report(&self, id: Uuid, report_json: &str) -> Result<()> {
+    async fn set_composition_report(&self, id: Uuid, report_json: &str) -> Result<bool> {
+        // Mirror production: the write only lands if the session node exists.
+        let exists = self.chat_sessions.read().await.contains_key(&id);
+        if !exists {
+            return Ok(false);
+        }
         let mut reports = self.composition_reports.write().await;
         reports.insert(id, report_json.to_string());
-        Ok(())
+        Ok(true)
     }
 
     async fn get_composition_report(&self, id: Uuid) -> Result<Option<String>> {
@@ -15446,5 +15451,60 @@ mod consolidation_tests {
 
         let stored = store.get_note(note.id).await.unwrap().unwrap();
         assert_eq!(stored.activation_count, 2);
+    }
+}
+
+#[cfg(test)]
+mod composition_report_tests {
+    use super::*;
+    use crate::neo4j::traits::GraphStore;
+
+    /// A write aimed at a node that does not exist yet must be reported as
+    /// such, not swallowed.
+    ///
+    /// `MATCH (s:ChatSession {id: $id}) SET ...` is a no-op when nothing
+    /// matches, and Cypher calls that success. `create_session` composed the
+    /// prompt before creating the ChatSession node, so every new session
+    /// recorded no report at all — chips absent, endpoint 404 — and only
+    /// resumed sessions ever had one. Nothing surfaced it because the write
+    /// returned Ok.
+    #[tokio::test]
+    async fn writing_a_report_before_the_session_exists_is_not_silent() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        let matched = store
+            .set_composition_report(session_id, r#"{"static_chars":1}"#)
+            .await
+            .unwrap();
+        assert!(
+            !matched,
+            "a write matching no session node reported success"
+        );
+        assert!(store
+            .get_composition_report(session_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_report_written_after_the_session_exists_reads_back() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        let mut node = crate::test_helpers::test_chat_session(None);
+        node.id = session_id;
+        store.create_chat_session(&node).await.unwrap();
+
+        let matched = store
+            .set_composition_report(session_id, r#"{"static_chars":42}"#)
+            .await
+            .unwrap();
+        assert!(matched);
+        assert_eq!(
+            store.get_composition_report(session_id).await.unwrap(),
+            Some(r#"{"static_chars":42}"#.to_string())
+        );
     }
 }

@@ -505,34 +505,40 @@ impl FsmPromptComposer {
         };
         let total_surplus = enrichment_surplus + continuity_surplus + project_surplus;
 
-        // Re-truncate with expanded budgets if there's meaningful surplus
+        // Re-truncate with expanded budgets if there's meaningful surplus.
+        //
+        // Track the budget each source was ACTUALLY rendered against, not the
+        // 40/30/30 sub-budget it started with: after redistribution a source
+        // can legitimately keep more than its opening allowance, and reporting
+        // the opening figure makes `kept_chars > budget_chars` — a pair that
+        // reads as a blown budget in any UI showing both.
+        let mut eff_enrichment_budget = enrichment_budget;
+        let mut eff_continuity_budget = continuity_budget;
+        let mut eff_project_budget = project_budget;
         let (final_enrichment, final_continuity, final_project) = if total_surplus > 500 {
             let extra_for_enrichment = continuity_surplus + project_surplus;
             let extra_for_continuity = enrichment_surplus + project_surplus;
             let extra_for_project = enrichment_surplus + continuity_surplus;
 
             let fe = if has_enrichment && extra_for_enrichment > 0 {
+                eff_enrichment_budget = enrichment_budget + extra_for_enrichment;
                 truncate_with_boost_reported(
                     enrichment,
-                    enrichment_budget + extra_for_enrichment,
+                    eff_enrichment_budget,
                     ENRICHMENT_SCORE_BONUS,
                 )
             } else {
                 (trunc_enrichment, det_enrichment)
             };
             let fc = if has_continuity && extra_for_continuity > 0 {
-                truncate_markdown_semantically_reported(
-                    continuity,
-                    continuity_budget + extra_for_continuity,
-                )
+                eff_continuity_budget = continuity_budget + extra_for_continuity;
+                truncate_markdown_semantically_reported(continuity, eff_continuity_budget)
             } else {
                 (trunc_continuity, det_continuity)
             };
             let fp = if has_project && extra_for_project > 0 {
-                truncate_markdown_semantically_reported(
-                    project_context,
-                    project_budget + extra_for_project,
-                )
+                eff_project_budget = project_budget + extra_for_project;
+                truncate_markdown_semantically_reported(project_context, eff_project_budget)
             } else {
                 (trunc_project, det_project)
             };
@@ -577,7 +583,7 @@ impl FsmPromptComposer {
             DynamicSource::Enrichment,
             enrichment,
             &final_enrichment,
-            enrichment_budget,
+            eff_enrichment_budget,
             det_enrichment,
             &mut reports,
             &mut dropped_content,
@@ -586,7 +592,7 @@ impl FsmPromptComposer {
             DynamicSource::Continuity,
             continuity,
             &final_continuity,
-            continuity_budget,
+            eff_continuity_budget,
             det_continuity,
             &mut reports,
             &mut dropped_content,
@@ -595,7 +601,7 @@ impl FsmPromptComposer {
             DynamicSource::ProjectContext,
             project_context,
             &final_project,
-            project_budget,
+            eff_project_budget,
             det_project,
             &mut reports,
             &mut dropped_content,
@@ -822,67 +828,87 @@ fn render_sections_budgeted_reported(
         sec.items.sort_by(|a, b| b.0.cmp(&a.0));
     }
 
-    let mut kept: Vec<usize> = sections.iter().map(|s| s.items.len()).collect();
-    let mut sizes: Vec<usize> = sections
-        .iter()
-        .enumerate()
-        .map(|(i, sec)| section_size(sec, kept[i]))
-        .collect();
-    let mut total: usize = sizes.iter().sum();
-
-    // Drop items one at a time, always the globally lowest-scoring item still
-    // kept. On a tie, take it from the section that still has the most items,
-    // so the last survivor of a small section outlives the tail of a big one
-    // and breadth degrades gracefully.
-    while total > char_budget {
-        let victim = sections
+    // Fit by dropping items; if the prose alone still overflows, drop the
+    // prose and fit again. Both passes share one loop.
+    let fit = |include_preamble: bool| -> Vec<usize> {
+        let mut kept: Vec<usize> = sections.iter().map(|s| s.items.len()).collect();
+        let mut sizes: Vec<usize> = sections
             .iter()
             .enumerate()
-            .filter(|(i, _)| kept[*i] > 0)
-            .min_by_key(|(i, sec)| (sec.items[kept[*i] - 1].0, std::cmp::Reverse(kept[*i])))
-            .map(|(i, _)| i);
+            .map(|(i, sec)| section_size(sec, kept[i], include_preamble))
+            .collect();
+        let mut total: usize = sizes.iter().sum();
 
-        let Some(i) = victim else {
-            // Every item is gone and the headers alone still overflow.
-            break;
-        };
+        // Drop items one at a time, always the globally lowest-scoring item
+        // still kept. On a tie, take it from the section that still has the
+        // most items, so the last survivor of a small section outlives the
+        // tail of a big one and breadth degrades gracefully.
+        while total > char_budget {
+            let victim = sections
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| kept[*i] > 0)
+                .min_by_key(|(i, sec)| (sec.items[kept[*i] - 1].0, std::cmp::Reverse(kept[*i])))
+                .map(|(i, _)| i);
 
-        kept[i] -= 1;
-        let new_size = section_size(&sections[i], kept[i]);
-        total = total + new_size - sizes[i];
-        sizes[i] = new_size;
-    }
+            let Some(i) = victim else {
+                // Every item is gone and the headers alone still overflow.
+                break;
+            };
 
-    let mut output = sections
-        .iter()
-        .enumerate()
-        .map(|(i, sec)| render_section(sec, kept[i]))
-        .collect::<Vec<_>>()
-        .join("\n");
+            kept[i] -= 1;
+            let new_size = section_size(&sections[i], kept[i], include_preamble);
+            total = total + new_size - sizes[i];
+            sizes[i] = new_size;
+        }
+        kept
+    };
 
-    // Degenerate case: headers and preambles alone exceed the budget. Shed
-    // preambles (descriptive prose, no scored content) before resorting to a
-    // byte cut, and say so explicitly rather than ending mid-sentence.
-    if output.len() > char_budget {
-        output = sections
+    let render = |kept: &[usize], include_preamble: bool| -> String {
+        sections
             .iter()
             .enumerate()
             .map(|(i, sec)| {
-                let stripped = MdSection {
-                    header: sec.header.clone(),
-                    preamble: Vec::new(),
-                    items: sec.items.clone(),
-                };
-                render_section(&stripped, kept[i])
+                if include_preamble {
+                    render_section(sec, kept[i])
+                } else {
+                    let stripped = MdSection {
+                        header: sec.header.clone(),
+                        preamble: Vec::new(),
+                        items: sec.items.clone(),
+                    };
+                    render_section(&stripped, kept[i])
+                }
             })
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+    };
+
+    let mut kept = fit(true);
+    let mut output = render(&kept, true);
+    let mut preambles_dropped = false;
+
+    // Degenerate case: headers and prose alone exceed the budget. Preambles
+    // are unscored descriptive text and, unlike items, the loop above cannot
+    // shed them — so it can drop every single item and still overflow.
+    //
+    // Shed the prose and REFIT. Stripping without refitting is what made the
+    // first version of this worse than the bug it replaced: a 6 KB prose
+    // section next to a one-line `[Critical]` global guideline rendered as two
+    // bare headers and 1932 unused characters of budget, having dropped the
+    // critical item it was supposed to protect.
+    if output.len() > char_budget {
+        preambles_dropped = true;
+        kept = fit(false);
+        output = render(&kept, false);
     }
 
+    let mut byte_cut = String::new();
     if output.len() > char_budget {
         const NOTICE: &str = "\n\n[... context truncated: section headers alone exceed the budget]";
         let room = char_budget.saturating_sub(NOTICE.len());
         let boundary = floor_char_boundary(&output, room);
+        byte_cut = output[boundary..].to_string();
         output.truncate(boundary);
         output.push_str(NOTICE);
     }
@@ -893,6 +919,21 @@ fn render_sections_budgeted_reported(
     // has to survive the call, not just a log line.
     let mut detail = TruncationDetail::default();
     for (i, sec) in sections.iter().enumerate() {
+        if preambles_dropped && !sec.preamble.is_empty() {
+            // Prose carries no items, so it would otherwise vanish from the
+            // accounting entirely — the report would claim thousands of
+            // truncated characters with nothing to show for them.
+            if !sec.header.is_empty() {
+                detail.dropped_content.push_str(&sec.header);
+                detail.dropped_content.push('\n');
+            }
+            for line in &sec.preamble {
+                detail.dropped_content.push_str(line);
+                detail.dropped_content.push('\n');
+            }
+            detail.dropped_content.push('\n');
+        }
+
         let dropped = sec.items.len().saturating_sub(kept[i]);
         if dropped == 0 {
             continue;
@@ -920,6 +961,12 @@ fn render_sections_budgeted_reported(
         detail.dropped_content.push('\n');
     }
 
+    if !byte_cut.is_empty() {
+        detail.dropped_content.push_str("# byte-truncated remainder\n\n");
+        detail.dropped_content.push_str(&byte_cut);
+        detail.dropped_content.push('\n');
+    }
+
     (output, detail)
 }
 
@@ -928,12 +975,14 @@ fn render_sections_budgeted_reported(
 /// Must stay in step with [`render_section`], which is what actually writes
 /// the bytes: a size estimate that drifts from the renderer is how a budget
 /// silently stops being a budget.
-fn section_size(sec: &MdSection, kept: usize) -> usize {
+fn section_size(sec: &MdSection, kept: usize, include_preamble: bool) -> usize {
     let mut size = 0usize;
     if !sec.header.is_empty() {
         size += sec.header.len() + 1;
     }
-    size += sec.preamble.iter().map(|l| l.len() + 1).sum::<usize>();
+    if include_preamble {
+        size += sec.preamble.iter().map(|l| l.len() + 1).sum::<usize>();
+    }
     size += sec
         .items
         .iter()
@@ -1096,6 +1145,94 @@ mod tests {
         assert!(report.truncated_content.contains("marker-"));
     }
 
+    /// Two invariants the report must never break.
+    ///
+    /// `kept_chars <= budget_chars` — the pair is shown side by side, and a
+    /// kept figure above its budget reads as a blown budget. It used to happen
+    /// whenever surplus redistribution let a source keep more than its opening
+    /// 40/30/30 allowance while the report still quoted the opening figure.
+    ///
+    /// `truncated_chars > 0` implies `truncated_content` is non-empty — a
+    /// report claiming thousands of lost characters with nothing to show is
+    /// exactly the "how much, never what" that made the original truncation
+    /// bug invisible. Prose-only sections used to do this: they carry no
+    /// items, so shedding them left no trace in the accounting.
+    #[test]
+    fn report_numbers_stay_self_consistent() {
+        let prose: String = (0..120)
+            .map(|i| format!("Structural line {i}: descriptive prose, no list marker whatsoever.\n"))
+            .collect();
+        let items: String = (0..60)
+            .map(|i| format!("- [Medium] guideline {i} with a body long enough to matter\n"))
+            .collect();
+        let md = format!(
+            "## Structural Topology\n{prose}\n## Guidelines\n{items}\n## Global Guidelines\n- [Critical] KEEP-ME-7749\n"
+        );
+        let input = over_budget_input(&md);
+
+        let (_prompt, _record, report) =
+            FsmPromptComposer::compose_reported(&input, &HeuristicRouter);
+
+        for source in &report.sources {
+            assert!(
+                source.kept_chars <= source.budget_chars,
+                "{:?} kept {} against a reported budget of {}",
+                source.source,
+                source.kept_chars,
+                source.budget_chars
+            );
+        }
+
+        if report.truncated_chars > 0 {
+            assert!(
+                !report.truncated_content.is_empty(),
+                "report claims {} truncated chars with nothing to show for them",
+                report.truncated_chars
+            );
+        }
+    }
+
+    /// The surplus-redistribution path specifically: a small source leaves
+    /// budget on the table, a big one takes it, and the big one's report must
+    /// quote the budget it was actually rendered against.
+    ///
+    /// Needs two active sources — with one, every sub-budget is the whole
+    /// budget and redistribution never runs.
+    #[test]
+    fn redistributed_budget_is_the_one_reported() {
+        let continuity = "## Continuity\n- [Low] resumed from yesterday\n";
+        let project: String = std::iter::once("## Guidelines\n".to_string())
+            .chain((0..400).map(|i| {
+                format!("- [Medium] guideline {i} with a body long enough to matter for the budget\n")
+            }))
+            .collect();
+
+        let budget = 8_000;
+        let (_rendered, reports, _cut) = FsmPromptComposer::build_dynamic_section_reported(
+            continuity, &project, "", budget,
+        );
+
+        let project_report = reports
+            .iter()
+            .find(|r| r.source == DynamicSource::ProjectContext)
+            .expect("project context must be reported");
+
+        // It took the continuity surplus, so it kept more than its opening 30%.
+        assert!(
+            project_report.kept_chars > (budget * 30) / 100,
+            "redistribution did not happen: kept {} <= opening budget {}",
+            project_report.kept_chars,
+            (budget * 30) / 100
+        );
+        assert!(
+            project_report.kept_chars <= project_report.budget_chars,
+            "kept {} against a reported budget of {} — the opening sub-budget \
+             was reported instead of the effective one",
+            project_report.kept_chars,
+            project_report.budget_chars
+        );
+    }
+
     /// Within budget: nothing is reported as lost, and no phantom sections.
     #[test]
     fn report_is_quiet_when_everything_fits() {
@@ -1154,6 +1291,35 @@ mod tests {
         assert!(
             !result.contains("[... context truncated"),
             "fell back to a byte cut instead of dropping items by score"
+        );
+    }
+
+    /// Prose sections must not be able to starve scored items.
+    ///
+    /// `context_to_markdown` emits sections made only of prose, with no list
+    /// items (Structural Topology, for one). Those lines count against the
+    /// budget but the drop loop cannot shed them, so it drops every item —
+    /// including a `[Critical]` one — and still overflows. The first version
+    /// of the fix then stripped the prose but kept the emptied item counts,
+    /// rendering two bare headers and leaving most of the budget unused: worse
+    /// than the byte cut it replaced. Stripping must be followed by a refit.
+    #[test]
+    fn prose_sections_cannot_starve_a_critical_item() {
+        let prose: String = (0..90)
+            .map(|i| format!("Structural line {i}: a paragraph of descriptive prose with no list marker at all.\n"))
+            .collect();
+        let md = format!(
+            "## Structural Topology\n{prose}\n## Global Guidelines\n- [Critical] KEEP-ME-7749\n"
+        );
+        assert!(md.len() > 6_000);
+
+        let budget = 2_000;
+        let result = truncate_markdown_semantically(&md, budget);
+
+        assert!(result.len() <= budget, "budget blown: {} chars", result.len());
+        assert!(
+            result.contains("KEEP-ME-7749"),
+            "prose crowded out the critical item; rendered:\n{result}"
         );
     }
 

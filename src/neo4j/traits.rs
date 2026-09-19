@@ -1895,7 +1895,10 @@ pub trait GraphStore: Send + Sync {
     async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()>;
 
     /// Store the composition report for a session's system prompt (JSON).
-    async fn set_composition_report(&self, id: Uuid, report_json: &str) -> Result<()>;
+    ///
+    /// Returns whether a session node matched — a zero-row MATCH is not an
+    /// error in Cypher, and a silent no-op here means a session with no report.
+    async fn set_composition_report(&self, id: Uuid, report_json: &str) -> Result<bool>;
 
     /// Read a session's composition report. `None` = never recorded, which is
     /// not the same as "nothing was truncated".

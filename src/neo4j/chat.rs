@@ -305,14 +305,26 @@ impl Neo4jClient {
     /// already ended. A live-only summary answers it for the current session
     /// and no other — which is how a truncation that beheaded whole sections
     /// of context went unnoticed for months.
-    pub async fn set_composition_report(&self, id: Uuid, report_json: &str) -> Result<()> {
+    /// Returns whether a session node actually matched.
+    ///
+    /// A zero-row `MATCH` is not an error in Cypher, so a write aimed at a
+    /// node that does not exist yet succeeds and does nothing. That is exactly
+    /// what happened here: `create_session` composed the prompt before
+    /// creating the ChatSession node, so every new session silently recorded
+    /// no report at all and only resumed sessions ever had one. The caller
+    /// must be able to tell "written" from "matched nothing".
+    pub async fn set_composition_report(&self, id: Uuid, report_json: &str) -> Result<bool> {
         let cypher = "MATCH (s:ChatSession {id: $id}) \
-                      SET s.composition_report_json = $report, s.updated_at = datetime()";
+                      SET s.composition_report_json = $report, s.updated_at = datetime() \
+                      RETURN count(s) AS updated";
         let q = query(cypher)
             .param("id", id.to_string())
             .param("report", report_json.to_string());
-        self.graph.run(q).await?;
-        Ok(())
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<i64>("updated").unwrap_or(0) > 0),
+            None => Ok(false),
+        }
     }
 
     /// Read back a session's composition report, if one was recorded.
