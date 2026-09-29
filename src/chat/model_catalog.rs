@@ -17,6 +17,10 @@
 //!   selector always has *something* sensible to show.
 //! - **Don't hammer the API.** The cache TTL is deliberately long (hours, not
 //!   minutes) — a new model appearing a few hours late is fine.
+//! - **No API key required.** When no `ANTHROPIC_API_KEY` is configured, the
+//!   catalog borrows the OAuth token Claude Code itself logged in with (see
+//!   `read_claude_code_oauth_token`). The Models API accepts it, and every
+//!   install that can chat at all has one.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -45,6 +49,17 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Defensive cap on pagination — the live catalog is small (dozens of
 /// models at most); this just prevents a buggy/malicious `has_more` loop.
 const MAX_PAGES: u8 = 5;
+
+/// Beta header that makes the Anthropic API accept a Claude.ai OAuth access
+/// token (`Authorization: Bearer`) instead of an `x-api-key`.
+const OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// macOS Keychain service under which Claude Code stores its login.
+const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// Upper bound on the `security` call — a Keychain access prompt must never
+/// wedge the background refresh.
+const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A single model entry, shaped for direct consumption by the frontend's
 /// model selector.
@@ -109,9 +124,9 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "Most capable — demanding reasoning & long-horizon agentic work",
     ),
     (
-        "claude-sonnet-5",
+        "claude-sonnet-5-5",
         "sonnet",
-        "5",
+        "5.5",
         TIER_CURRENT,
         "Best balance of speed and intelligence",
     ),
@@ -135,6 +150,13 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "5",
         TIER_LEGACY,
         "Legacy — superseded by Fable 5.1",
+    ),
+    (
+        "claude-sonnet-5",
+        "sonnet",
+        "5",
+        TIER_LEGACY,
+        "Legacy — superseded by Sonnet 5.5",
     ),
     (
         "claude-opus-4-8",
@@ -221,6 +243,7 @@ fn curated_lookup(id: &str) -> Option<ModelDefinition> {
 /// `"claude-opus-4-9"` -> `("opus", "4.9")`; `"claude-foo-bar-7"` ->
 /// `("other", "7")`. Trailing numeric segments are joined with dots.
 fn derive_family_version(id: &str) -> (String, String) {
+    let id = canonical_id(id);
     let without_prefix = id.strip_prefix("claude-").unwrap_or(id);
     let parts: Vec<&str> = without_prefix.split('-').collect();
 
@@ -242,6 +265,22 @@ fn derive_family_version(id: &str) -> (String, String) {
         .unwrap_or_else(|| "other".to_string());
 
     (family, version)
+}
+
+/// Strip a trailing snapshot date: `"claude-haiku-4-5-20251001"` ->
+/// `"claude-haiku-4-5"`. The Models API lists some models only under their
+/// dated snapshot ID; without this they would neither match their curated
+/// alias (showing up twice) nor derive a sane version (`"4.5.20251001"`).
+fn canonical_id(id: &str) -> &str {
+    match id.rsplit_once('-') {
+        Some((head, tail)) if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => id,
+    }
+}
+
+/// `"5.5"` -> `[5, 5]`, for numeric (not lexicographic) version ordering.
+fn version_key(version: &str) -> Vec<u32> {
+    version.split('.').filter_map(|p| p.parse().ok()).collect()
 }
 
 /// Build a full `ModelDefinition` for a model ID the live API returned,
@@ -282,6 +321,88 @@ struct AnthropicModelEntry {
     display_name: Option<String>,
 }
 
+/// Where the live fetch gets its credential from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CredentialSource {
+    /// Never fetch — serve the static fallback. Used by tests and by the
+    /// throwaway caches in handler test fixtures.
+    None,
+    /// An explicitly configured Anthropic API key.
+    ApiKey(String),
+    /// Reuse Claude Code's own login (read fresh on every refresh, since the
+    /// CLI rotates the access token).
+    ClaudeCodeLogin,
+}
+
+/// A credential resolved for one refresh.
+enum Credential {
+    ApiKey(String),
+    OAuth(String),
+}
+
+/// Extract a still-valid access token from Claude Code's credentials JSON
+/// (`{"claudeAiOauth": {"accessToken", "expiresAt" (ms), ...}}`).
+///
+/// An expired token is rejected rather than refreshed: refreshing would
+/// rotate the refresh token behind the CLI's back and could log it out. The
+/// CLI refreshes on its next use, and the next catalog refresh picks it up.
+fn parse_claude_code_credentials(raw: &str, now_ms: i64) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let oauth = json.get("claudeAiOauth")?;
+    let token = oauth.get("accessToken")?.as_str()?.trim();
+    if token.is_empty() {
+        return None;
+    }
+    if let Some(expires_at) = oauth.get("expiresAt").and_then(|v| v.as_i64()) {
+        if expires_at <= now_ms {
+            return None;
+        }
+    }
+    Some(token.to_string())
+}
+
+/// Find the OAuth access token Claude Code is logged in with.
+///
+/// Lookup order: `CLAUDE_CODE_OAUTH_TOKEN` (long-lived token from
+/// `claude setup-token`), then the macOS Keychain, then
+/// `$CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude`, which is
+/// where the CLI stores it on Linux).
+async fn read_claude_code_oauth_token() -> Option<String> {
+    if let Ok(token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+        if !token.trim().is_empty() {
+            return Some(token.trim().to_string());
+        }
+    }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    if cfg!(target_os = "macos") {
+        let lookup = tokio::process::Command::new("security")
+            .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(KEYCHAIN_TIMEOUT, lookup).await {
+            Ok(Ok(out)) if out.status.success() => {
+                let raw = String::from_utf8_lossy(&out.stdout);
+                if let Some(token) = parse_claude_code_credentials(&raw, now_ms) {
+                    return Some(token);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => tracing::warn!("Timed out reading Claude Code login from the Keychain"),
+        }
+    }
+
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))?;
+    let raw = tokio::fs::read_to_string(config_dir.join(".credentials.json"))
+        .await
+        .ok()?;
+    parse_claude_code_credentials(&raw, now_ms)
+}
+
 struct CacheState {
     models: Vec<ModelDefinition>,
     fetched_at: Instant,
@@ -299,7 +420,7 @@ struct Notifier {
 pub struct ModelCatalogCache {
     inner: RwLock<CacheState>,
     http: reqwest::Client,
-    api_key: Option<String>,
+    credentials: CredentialSource,
     notifier: Option<Notifier>,
 }
 
@@ -308,6 +429,14 @@ impl ModelCatalogCache {
     /// first call to `get_models()` seeds it with the static fallback and
     /// kicks off a background refresh if an API key is configured.
     pub fn new(api_key: Option<String>) -> Arc<Self> {
+        let credentials = match api_key {
+            Some(key) if !key.trim().is_empty() => CredentialSource::ApiKey(key),
+            _ => CredentialSource::None,
+        };
+        Self::with_credentials(credentials)
+    }
+
+    fn with_credentials(credentials: CredentialSource) -> Arc<Self> {
         Arc::new(Self {
             inner: RwLock::new(CacheState {
                 models: static_fallback_models(),
@@ -320,19 +449,35 @@ impl ModelCatalogCache {
                 .timeout(FETCH_TIMEOUT)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
-            api_key,
+            credentials,
             notifier: None,
         })
     }
 
-    /// Same as `new`, plus the handles required to announce a model that
-    /// appears in the live catalog for the first time.
+    /// Production constructor: like `new`, plus the handles required to
+    /// announce a model that appears in the live catalog for the first time.
+    ///
+    /// Without an API key, falls back to Claude Code's own login rather than
+    /// to the static list — so a subscription-only install still sees new
+    /// models without any configuration.
     pub fn new_with_notifier(
         api_key: Option<String>,
         emitter: Arc<dyn EventEmitter>,
         graph: Arc<dyn GraphStore>,
     ) -> Arc<Self> {
-        let mut cache = Arc::try_unwrap(Self::new(api_key))
+        let credentials = match api_key {
+            Some(key) if !key.trim().is_empty() => CredentialSource::ApiKey(key),
+            _ => CredentialSource::ClaudeCodeLogin,
+        };
+        Self::new_with_notifier_and_credentials(credentials, emitter, graph)
+    }
+
+    fn new_with_notifier_and_credentials(
+        credentials: CredentialSource,
+        emitter: Arc<dyn EventEmitter>,
+        graph: Arc<dyn GraphStore>,
+    ) -> Arc<Self> {
+        let mut cache = Arc::try_unwrap(Self::with_credentials(credentials))
             .unwrap_or_else(|_| unreachable!("freshly created Arc is unique"));
         cache.notifier = Some(Notifier { emitter, graph });
         Arc::new(cache)
@@ -348,7 +493,7 @@ impl ModelCatalogCache {
             !state.refreshing && state.fetched_at.elapsed() >= CACHE_TTL
         };
 
-        if needs_refresh && self.api_key.is_some() {
+        if needs_refresh && self.credentials != CredentialSource::None {
             let mut state = self.inner.write().await;
             // Re-check under the write lock — another task may have started
             // the refresh between our read and this write.
@@ -507,11 +652,24 @@ impl ModelCatalogCache {
         Ok(keys)
     }
 
+    async fn resolve_credential(&self) -> anyhow::Result<Credential> {
+        match &self.credentials {
+            CredentialSource::None => anyhow::bail!("no credential configured"),
+            CredentialSource::ApiKey(key) => Ok(Credential::ApiKey(key.clone())),
+            CredentialSource::ClaudeCodeLogin => read_claude_code_oauth_token()
+                .await
+                .map(Credential::OAuth)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no ANTHROPIC_API_KEY and no valid Claude Code login found \
+                         (run `claude` once to log in, or set anthropic.api_key)"
+                    )
+                }),
+        }
+    }
+
     async fn fetch_live_catalog(&self) -> anyhow::Result<Vec<ModelDefinition>> {
-        let api_key = self
-            .api_key
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no Anthropic API key configured"))?;
+        let credential = self.resolve_credential().await?;
 
         let mut entries: Vec<AnthropicModelEntry> = Vec::new();
         let mut after_id: Option<String> = None;
@@ -520,8 +678,13 @@ impl ModelCatalogCache {
             let mut req = self
                 .http
                 .get(ANTHROPIC_MODELS_URL)
-                .header("x-api-key", api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION);
+            req = match &credential {
+                Credential::ApiKey(key) => req.header("x-api-key", key),
+                Credential::OAuth(token) => {
+                    req.bearer_auth(token).header("anthropic-beta", OAUTH_BETA)
+                }
+            };
             if let Some(cursor) = &after_id {
                 req = req.query(&[("after_id", cursor.as_str())]);
             }
@@ -538,39 +701,69 @@ impl ModelCatalogCache {
             after_id = last_id;
         }
 
-        // Curated models first (in our preferred order), then anything the
-        // live API knows about that we haven't curated yet, newest-looking
-        // (API order) last.
-        //
-        // Curated entries are ALWAYS included, even when absent from the
-        // Models API response. Chat goes through the Claude Code CLI (its own
-        // auth/routing), which can serve models the first-party Models API
-        // doesn't list — e.g. `claude-fable-5` works via the CLI while being
-        // absent from the API. Gating curation on API presence silently
-        // dropped such models from the selector. Deactivating a model is now
-        // an explicit act (remove its CURATED_ORDER entry) rather than an
-        // implicit side effect of an API listing change.
-        let mut seen = std::collections::HashSet::new();
-        let mut models: Vec<ModelDefinition> = Vec::new();
-
-        for (id, ..) in CURATED_ORDER {
-            let api_entry = entries.iter().find(|e| e.id == *id);
-            models.push(resolve_model(
-                id,
-                api_entry.and_then(|e| e.display_name.as_deref()),
-            ));
-            seen.insert(id.to_string());
-        }
-        for entry in &entries {
-            if seen.contains(&entry.id) {
-                continue;
-            }
-            models.push(resolve_model(&entry.id, entry.display_name.as_deref()));
-            seen.insert(entry.id.clone());
-        }
-
-        Ok(models)
+        Ok(merge_catalog(&entries))
     }
+}
+
+/// Merge the live Models API listing with local curation.
+///
+/// Curated models first (in our preferred order), then anything the live
+/// API knows about that we haven't curated yet, in API order.
+///
+/// Curated entries are ALWAYS included, even when absent from the Models
+/// API response. Chat goes through the Claude Code CLI (its own
+/// auth/routing), which can serve models the first-party Models API doesn't
+/// list — e.g. `claude-fable-5` works via the CLI while being absent from
+/// the API. Gating curation on API presence silently dropped such models
+/// from the selector. Deactivating a model is an explicit act (remove its
+/// CURATED_ORDER entry) rather than an implicit side effect of an API
+/// listing change.
+///
+/// An uncurated model is `current` only if nothing newer of its family is
+/// in the list: the API also lists older snapshots nobody has curated
+/// (e.g. `claude-sonnet-4-5-20250929`), which must not be advertised as
+/// part of the active lineup.
+fn merge_catalog(entries: &[AnthropicModelEntry]) -> Vec<ModelDefinition> {
+    let mut seen = HashSet::new();
+    let mut models: Vec<ModelDefinition> = Vec::new();
+
+    for (id, ..) in CURATED_ORDER {
+        let api_entry = entries.iter().find(|e| canonical_id(&e.id) == *id);
+        models.push(resolve_model(
+            id,
+            api_entry.and_then(|e| e.display_name.as_deref()),
+        ));
+        seen.insert(id.to_string());
+    }
+
+    let curated_count = models.len();
+    for entry in entries {
+        let canonical = canonical_id(&entry.id);
+        if !seen.insert(canonical.to_string()) {
+            continue;
+        }
+        models.push(resolve_model(&entry.id, entry.display_name.as_deref()));
+    }
+
+    let newest = |family: &str| {
+        models
+            .iter()
+            .filter(|m| m.family == family)
+            .map(|m| version_key(&m.version))
+            .max()
+            .unwrap_or_default()
+    };
+    let demote: Vec<usize> = (curated_count..models.len())
+        .filter(|&i| {
+            let m = &models[i];
+            m.family != "other" && version_key(&m.version) < newest(&m.family)
+        })
+        .collect();
+    for i in demote {
+        models[i].tier = TIER_LEGACY.to_string();
+    }
+
+    models
 }
 
 #[cfg(test)]
@@ -660,6 +853,7 @@ mod tests {
         assert!(fable.is_some());
         assert_eq!(fable.unwrap().short_label, "Fable 5");
         assert!(curated_lookup("claude-sonnet-5").is_some());
+        assert!(curated_lookup("claude-sonnet-5-5").is_some());
     }
 
     #[test]
@@ -668,7 +862,7 @@ mod tests {
         assert!(!models.is_empty());
         assert_eq!(models[0].id, "claude-opus-5-5");
         assert_eq!(models[1].id, "claude-fable-5-1");
-        assert_eq!(models[2].id, "claude-sonnet-5");
+        assert_eq!(models[2].id, "claude-sonnet-5-5");
     }
 
     #[test]
@@ -686,6 +880,115 @@ mod tests {
         assert_eq!(m.version, "9");
         assert_eq!(m.tier, TIER_CURRENT);
         assert_eq!(m.description, "");
+    }
+
+    #[test]
+    fn test_canonical_id_strips_snapshot_date_only() {
+        assert_eq!(
+            canonical_id("claude-haiku-4-5-20251001"),
+            "claude-haiku-4-5"
+        );
+        assert_eq!(canonical_id("claude-sonnet-5-5"), "claude-sonnet-5-5");
+        // A 7-digit tail is not a date.
+        assert_eq!(canonical_id("claude-x-1234567"), "claude-x-1234567");
+        assert_eq!(
+            derive_family_version("claude-opus-4-5-20251101"),
+            ("opus".into(), "4.5".into())
+        );
+    }
+
+    fn entry(id: &str, name: &str) -> AnthropicModelEntry {
+        AnthropicModelEntry {
+            id: id.into(),
+            display_name: Some(name.into()),
+        }
+    }
+
+    #[test]
+    fn test_merge_catalog_matches_dated_ids_to_curated_aliases() {
+        let models = merge_catalog(&[
+            entry("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+            entry("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+        ]);
+        let haikus: Vec<_> = models.iter().filter(|m| m.family == "haiku").collect();
+        assert_eq!(
+            haikus.len(),
+            1,
+            "dated snapshot must not duplicate the curated alias"
+        );
+        assert_eq!(haikus[0].id, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn test_merge_catalog_uncurated_models_tiered_by_family_recency() {
+        let models = merge_catalog(&[
+            entry("claude-sonnet-6", "Claude Sonnet 6"),
+            entry("claude-sonnet-4-5-20250929", "Claude Sonnet 4.5"),
+        ]);
+        let find = |id: &str| models.iter().find(|m| m.id == id).unwrap();
+        // Newest of its family -> advertised as current.
+        assert_eq!(find("claude-sonnet-6").tier, TIER_CURRENT);
+        assert_eq!(find("claude-sonnet-6").version, "6");
+        // An old uncurated snapshot -> legacy, with a clean version.
+        let old = find("claude-sonnet-4-5-20250929");
+        assert_eq!(old.tier, TIER_LEGACY);
+        assert_eq!(old.short_label, "Sonnet 4.5");
+    }
+
+    #[test]
+    fn test_merge_catalog_keeps_curated_tiers() {
+        // Curation stays authoritative even when an uncurated newer model
+        // exists; only uncurated entries are auto-tiered.
+        let models = merge_catalog(&[entry("claude-opus-6", "Claude Opus 6")]);
+        let opus55 = models.iter().find(|m| m.id == "claude-opus-5-5").unwrap();
+        assert_eq!(opus55.tier, TIER_CURRENT);
+    }
+
+    #[test]
+    fn test_version_key_is_numeric() {
+        assert!(version_key("4.10") > version_key("4.9"));
+        assert!(version_key("5") < version_key("5.5"));
+    }
+
+    #[test]
+    fn test_parse_claude_code_credentials() {
+        let now = 1_000_000;
+        let valid = r#"{"claudeAiOauth":{"accessToken":"tok","expiresAt":2000000}}"#;
+        assert_eq!(
+            parse_claude_code_credentials(valid, now),
+            Some("tok".into())
+        );
+
+        let expired = r#"{"claudeAiOauth":{"accessToken":"tok","expiresAt":999999}}"#;
+        assert_eq!(parse_claude_code_credentials(expired, now), None);
+
+        let no_expiry = r#"{"claudeAiOauth":{"accessToken":"tok"}}"#;
+        assert_eq!(
+            parse_claude_code_credentials(no_expiry, now),
+            Some("tok".into())
+        );
+
+        assert_eq!(parse_claude_code_credentials(r#"{"other":{}}"#, now), None);
+        assert_eq!(parse_claude_code_credentials("not json", now), None);
+        let empty = r#"{"claudeAiOauth":{"accessToken":"  "}}"#;
+        assert_eq!(parse_claude_code_credentials(empty, now), None);
+    }
+
+    #[test]
+    fn test_production_constructor_uses_claude_code_login_without_key() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let emitter = Arc::new(RecordingEmitter::default());
+        let cache = ModelCatalogCache::new_with_notifier(None, emitter.clone(), graph.clone());
+        assert_eq!(cache.credentials, CredentialSource::ClaudeCodeLogin);
+
+        let cache = ModelCatalogCache::new_with_notifier(Some("k".into()), emitter, graph);
+        assert_eq!(cache.credentials, CredentialSource::ApiKey("k".into()));
+
+        // The plain constructor (test fixtures) must stay offline.
+        assert_eq!(
+            ModelCatalogCache::new(None).credentials,
+            CredentialSource::None
+        );
     }
 
     /// Records every CrudEvent it is handed, so a test can assert on what
@@ -728,7 +1031,7 @@ mod tests {
         graph: Arc<dyn GraphStore>,
         emitter: Arc<RecordingEmitter>,
     ) -> Arc<ModelCatalogCache> {
-        ModelCatalogCache::new_with_notifier(None, emitter, graph)
+        ModelCatalogCache::new_with_notifier_and_credentials(CredentialSource::None, emitter, graph)
     }
 
     #[tokio::test]
