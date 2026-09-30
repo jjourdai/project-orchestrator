@@ -1855,6 +1855,18 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                     let mut failed = 0usize;
 
                     for server in &unique_servers {
+                        // Env vars / headers saved with the server (secrets included).
+                        let secrets: serde_json::Value = server
+                            .transport_secrets
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(s).ok())
+                            .unwrap_or_default();
+                        let saved_map = |key: &str| -> std::collections::HashMap<String, String> {
+                            secrets
+                                .get(key)
+                                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                                .unwrap_or_default()
+                        };
                         // Rebuild McpTransport from stored fields
                         let transport = match server.transport_type.as_str() {
                             "stdio" => {
@@ -1874,7 +1886,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                                 mcp_federation::McpTransport::Stdio {
                                     command: command.clone(),
                                     args,
-                                    env: std::collections::HashMap::new(),
+                                    env: saved_map("env"),
                                 }
                             }
                             "sse" => {
@@ -1888,7 +1900,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                                 };
                                 mcp_federation::McpTransport::Sse {
                                     url: url.clone(),
-                                    headers: std::collections::HashMap::new(),
+                                    headers: saved_map("headers"),
                                 }
                             }
                             "streamable_http" => {
@@ -1902,7 +1914,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                                 };
                                 mcp_federation::McpTransport::StreamableHttp {
                                     url: url.clone(),
-                                    headers: std::collections::HashMap::new(),
+                                    headers: saved_map("headers"),
                                 }
                             }
                             other => {
@@ -1922,12 +1934,23 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                             transport,
                         };
 
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            registry.write().await.connect(config),
-                        )
-                        .await
-                        {
+                        // A few attempts with a growing pause: at boot the network, the
+                        // package runner or the PATH may not be ready on the first try.
+                        let mut attempt = 0u32;
+                        let outcome = loop {
+                            let res = tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                registry.write().await.connect(config.clone()),
+                            )
+                            .await;
+                            if matches!(res, Ok(Ok(_))) || attempt >= 2 {
+                                break res;
+                            }
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_secs(10 * attempt as u64))
+                                .await;
+                        };
+                        match outcome {
                             Ok(Ok(_summary)) => {
                                 tracing::info!("MCP federation: restored '{}'", server.server_id);
                                 connected += 1;
