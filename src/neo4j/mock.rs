@@ -865,22 +865,24 @@ impl GraphStore for MockGraphStore {
         description: Option<String>,
         status: Option<MilestoneStatus>,
         target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<()> {
-        if let Some(m) = self.workspace_milestones.write().await.get_mut(&id) {
-            if let Some(t) = title {
-                m.title = t;
-            }
-            if let Some(d) = description {
-                m.description = Some(d);
-            }
-            if let Some(s) = status {
-                m.status = s;
-            }
-            if let Some(td) = target_date {
-                m.target_date = Some(td);
-            }
+    ) -> Result<bool> {
+        let mut milestones = self.workspace_milestones.write().await;
+        let Some(m) = milestones.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some(t) = title {
+            m.title = t;
         }
-        Ok(())
+        if let Some(d) = description {
+            m.description = Some(d);
+        }
+        if let Some(s) = status {
+            m.status = s;
+        }
+        if let Some(td) = target_date {
+            m.target_date = Some(td);
+        }
+        Ok(true)
     }
 
     async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()> {
@@ -1091,26 +1093,28 @@ impl GraphStore for MockGraphStore {
         url: Option<String>,
         version: Option<String>,
         description: Option<String>,
-    ) -> Result<()> {
-        if let Some(r) = self.resources.write().await.get_mut(&id) {
-            if let Some(n) = name {
-                r.name = n;
-            }
-            if let Some(fp) = file_path {
-                r.file_path = fp;
-            }
-            if let Some(u) = url {
-                r.url = Some(u);
-            }
-            if let Some(v) = version {
-                r.version = Some(v);
-            }
-            if let Some(d) = description {
-                r.description = Some(d);
-            }
-            r.updated_at = Some(Utc::now());
+    ) -> Result<bool> {
+        let mut resources = self.resources.write().await;
+        let Some(r) = resources.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some(n) = name {
+            r.name = n;
         }
-        Ok(())
+        if let Some(fp) = file_path {
+            r.file_path = fp;
+        }
+        if let Some(u) = url {
+            r.url = Some(u);
+        }
+        if let Some(v) = version {
+            r.version = Some(v);
+        }
+        if let Some(d) = description {
+            r.description = Some(d);
+        }
+        r.updated_at = Some(Utc::now());
+        Ok(true)
     }
 
     async fn delete_resource(&self, id: Uuid) -> Result<()> {
@@ -1201,7 +1205,7 @@ impl GraphStore for MockGraphStore {
             .collect())
     }
 
-    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<()> {
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool> {
         let ComponentUpdate {
             name,
             component_type,
@@ -1210,27 +1214,30 @@ impl GraphStore for MockGraphStore {
             config,
             tags,
         } = patch;
-        if let Some(c) = self.components.write().await.get_mut(&id) {
-            if let Some(n) = name {
-                c.name = n;
-            }
-            if let Some(t) = component_type {
-                c.component_type = t;
-            }
-            if let Some(d) = description {
-                c.description = Some(d);
-            }
-            if let Some(r) = runtime {
-                c.runtime = Some(r);
-            }
-            if let Some(cfg) = config {
-                c.config = cfg;
-            }
-            if let Some(t) = tags {
-                c.tags = t;
-            }
+        let mut components = self.components.write().await;
+        // Same contract as the store: an unknown id writes nothing and says so.
+        let Some(c) = components.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some(n) = name {
+            c.name = n;
         }
-        Ok(())
+        if let Some(t) = component_type {
+            c.component_type = t;
+        }
+        if let Some(d) = description {
+            c.description = Some(d);
+        }
+        if let Some(r) = runtime {
+            c.runtime = Some(r);
+        }
+        if let Some(cfg) = config {
+            c.config = cfg;
+        }
+        if let Some(t) = tags {
+            c.tags = t;
+        }
+        Ok(true)
     }
 
     async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid> {
@@ -3469,31 +3476,39 @@ impl GraphStore for MockGraphStore {
         Ok(slugs)
     }
 
+    /// Mirrors Neo4j (`plan.rs` link_plan_to_project): `MATCH` project and
+    /// plan (no-op if either is missing), `SET plan.project_id`, then
+    /// `MERGE (project)-[:HAS_PLAN]->(plan)`. MERGE is additive and
+    /// idempotent: previous HAS_PLAN links are KEPT (this is not a move).
     async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()> {
-        if let Some(p) = self.plans.write().await.get_mut(&plan_id) {
-            // Remove from old project if any
-            if let Some(old_pid) = p.project_id {
-                if let Some(ids) = self.project_plans.write().await.get_mut(&old_pid) {
-                    ids.retain(|id| *id != plan_id);
-                }
-            }
-            p.project_id = Some(project_id);
+        if !self.projects.read().await.contains_key(&project_id) {
+            return Ok(());
         }
-        self.project_plans
-            .write()
-            .await
-            .entry(project_id)
-            .or_default()
-            .push(plan_id);
+        match self.plans.write().await.get_mut(&plan_id) {
+            Some(p) => p.project_id = Some(project_id),
+            None => return Ok(()),
+        }
+        let mut project_plans = self.project_plans.write().await;
+        let ids = project_plans.entry(project_id).or_default();
+        if !ids.contains(&plan_id) {
+            ids.push(plan_id);
+        }
         Ok(())
     }
 
+    /// Mirrors Neo4j: deletes EVERY HAS_PLAN pointing at the plan (not only
+    /// the one matching `plan.project_id`) and clears `project_id`.
     async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()> {
-        if let Some(p) = self.plans.write().await.get_mut(&plan_id) {
-            if let Some(pid) = p.project_id.take() {
-                if let Some(ids) = self.project_plans.write().await.get_mut(&pid) {
-                    ids.retain(|id| *id != plan_id);
-                }
+        let mut linked = false;
+        for ids in self.project_plans.write().await.values_mut() {
+            let before = ids.len();
+            ids.retain(|id| *id != plan_id);
+            linked |= ids.len() != before;
+        }
+        // Neo4j only reaches the SET when at least one HAS_PLAN matched.
+        if linked {
+            if let Some(p) = self.plans.write().await.get_mut(&plan_id) {
+                p.project_id = None;
             }
         }
         Ok(())
@@ -3513,11 +3528,10 @@ impl GraphStore for MockGraphStore {
             }
         }
         self.plan_commits.write().await.remove(&plan_id);
-        if let Some(plan) = self.plans.write().await.remove(&plan_id) {
-            if let Some(pid) = plan.project_id {
-                if let Some(ids) = self.project_plans.write().await.get_mut(&pid) {
-                    ids.retain(|id| *id != plan_id);
-                }
+        if self.plans.write().await.remove(&plan_id).is_some() {
+            // DETACH DELETE drops every HAS_PLAN, not only plan.project_id's.
+            for ids in self.project_plans.write().await.values_mut() {
+                ids.retain(|id| *id != plan_id);
             }
         }
         Ok(())
@@ -15058,6 +15072,111 @@ mod tests {
 
         assert_eq!(store.count_project_files(p1.id).await.unwrap(), 2);
         assert_eq!(store.count_project_files(p2.id).await.unwrap(), 5);
+    }
+
+    // ── couac2: link_plan_to_project must mirror Neo4j (MERGE = additive) ──
+
+    async fn plan_ids_of(store: &MockGraphStore, project_id: Uuid) -> Vec<Uuid> {
+        store
+            .list_project_plans(project_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_link_plan_to_second_project_keeps_first_link() {
+        let store = MockGraphStore::new();
+        let p1 = crate::test_helpers::test_project_named("p1");
+        let p2 = crate::test_helpers::test_project_named("p2");
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(p1.id);
+        store.create_plan(&plan).await.unwrap();
+
+        store.link_plan_to_project(plan.id, p2.id).await.unwrap();
+
+        // Neo4j: MERGE adds (p2)-[:HAS_PLAN]->(plan), (p1)-[:HAS_PLAN] stays.
+        assert_eq!(plan_ids_of(&store, p1.id).await, vec![plan.id]);
+        assert_eq!(plan_ids_of(&store, p2.id).await, vec![plan.id]);
+        // SET plan.project_id = the last linked project
+        let stored = store.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(stored.project_id, Some(p2.id));
+    }
+
+    #[tokio::test]
+    async fn test_link_plan_to_project_is_idempotent() {
+        let store = MockGraphStore::new();
+        let p = test_project();
+        store.create_project(&p).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(p.id);
+        store.create_plan(&plan).await.unwrap();
+        store.link_plan_to_project(plan.id, p.id).await.unwrap();
+        store.link_plan_to_project(plan.id, p.id).await.unwrap();
+        assert_eq!(plan_ids_of(&store, p.id).await, vec![plan.id]);
+        assert_eq!(store.count_project_plans(p.id).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_link_plan_to_missing_project_or_plan_is_noop() {
+        let store = MockGraphStore::new();
+        let p = test_project();
+        store.create_project(&p).await.unwrap();
+        let plan = crate::test_helpers::test_plan();
+        store.create_plan(&plan).await.unwrap();
+
+        let ghost_project = Uuid::new_v4();
+        store
+            .link_plan_to_project(plan.id, ghost_project)
+            .await
+            .unwrap();
+        assert!(plan_ids_of(&store, ghost_project).await.is_empty());
+        let stored = store.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(stored.project_id, plan.project_id, "MATCH failed: no SET");
+
+        store
+            .link_plan_to_project(Uuid::new_v4(), p.id)
+            .await
+            .unwrap();
+        assert!(plan_ids_of(&store, p.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unlink_plan_removes_every_project_link() {
+        let store = MockGraphStore::new();
+        let p1 = crate::test_helpers::test_project_named("p1");
+        let p2 = crate::test_helpers::test_project_named("p2");
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(p1.id);
+        store.create_plan(&plan).await.unwrap();
+        store.link_plan_to_project(plan.id, p2.id).await.unwrap();
+
+        store.unlink_plan_from_project(plan.id).await.unwrap();
+
+        assert!(plan_ids_of(&store, p1.id).await.is_empty());
+        assert!(plan_ids_of(&store, p2.id).await.is_empty());
+        let stored = store.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(stored.project_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_delete_plan_linked_to_two_projects_removes_both_links() {
+        let store = MockGraphStore::new();
+        let p1 = crate::test_helpers::test_project_named("p1");
+        let p2 = crate::test_helpers::test_project_named("p2");
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(p1.id);
+        store.create_plan(&plan).await.unwrap();
+        store.link_plan_to_project(plan.id, p2.id).await.unwrap();
+
+        store.delete_plan(plan.id).await.unwrap();
+
+        assert!(plan_ids_of(&store, p1.id).await.is_empty());
+        assert!(plan_ids_of(&store, p2.id).await.is_empty());
     }
 
     #[tokio::test]
