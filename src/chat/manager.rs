@@ -380,6 +380,9 @@ pub struct ChatManager {
     /// MCP Federation registry for external server connections.
     /// The McpFederationStage injects tool availability into prompts when servers are connected.
     pub(crate) mcp_registry: crate::mcp_federation::registry::SharedRegistry,
+    /// Secrets vault: mints the per-session vault token and masks agent output.
+    /// None in tests and when the server runs without one.
+    pub(crate) vault: Option<Arc<crate::vault::VaultService>>,
 }
 
 // ============================================================================
@@ -741,6 +744,7 @@ impl ChatManager {
             context_injector: None,
             memory_config: None,
             event_emitter: None,
+            vault: None,
             nats: None,
             permission_config,
             config_yaml_path: None,
@@ -796,6 +800,7 @@ impl ChatManager {
             context_injector,
             memory_config: Some(memory_config),
             event_emitter: None,
+            vault: None,
             nats: None,
             permission_config,
             config_yaml_path: None,
@@ -819,6 +824,12 @@ impl ChatManager {
     /// Set the config.yaml path for persisting permission config changes.
     pub fn with_config_yaml_path(mut self, path: std::path::PathBuf) -> Self {
         self.config_yaml_path = Some(path);
+        self
+    }
+
+    /// Attach the secrets vault (per-session vault token + output masking).
+    pub fn with_vault(mut self, vault: Arc<crate::vault::VaultService>) -> Self {
+        self.vault = Some(vault);
         self
     }
 
@@ -2198,6 +2209,36 @@ impl ChatManager {
             }
         }
 
+        // Vault token: signs the session id, so the server knows which session
+        // is asking for a secret without trusting anything the agent can edit.
+        // Needs auth (a signing key) and a session; otherwise the agent has no
+        // vault access at all.
+        let vault_token = match (
+            &self.vault,
+            &self.config.jwt_secret,
+            user_claims,
+            session_id,
+        ) {
+            (Some(_), Some(secret), Some(claims), Some(sid)) => {
+                match crate::auth::jwt::generate_vault_token(
+                    claims,
+                    sid,
+                    secret,
+                    self.config.session_token_expiry_secs,
+                ) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!("Failed to mint vault token: {e} — no vault access");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(ref t) = vault_token {
+            env.insert("PO_VAULT_TOKEN".into(), t.clone());
+        }
+
         // Inject session ID so MCP subprocess can send it as X-Session-Id header
         // on all REST API calls — enables server-side auto-linking of sessions
         // to tasks/plans without the agent needing to pass session_id explicitly.
@@ -2271,12 +2312,35 @@ impl ChatManager {
             }
         }
 
+        // The agent's shell reads granted secrets with `orchestrator secret get`,
+        // which needs these two. The value then flows through a pipe, never
+        // through the model's context.
+        if let Some(t) = vault_token {
+            builder = builder.env("PO_VAULT_TOKEN", &t).env(
+                "PO_SERVER_URL",
+                format!("http://127.0.0.1:{}", self.config.server_port),
+            );
+        }
+
         builder.build()
     }
 
     // ========================================================================
     // Message → ChatEvent conversion
     // ========================================================================
+
+    /// Replace every secret value delivered by the vault inside a CLI message,
+    /// before anything reads, stores or broadcasts it.
+    pub(crate) fn mask_cli_message(msg: Message) -> Message {
+        let masker = crate::vault::mask::global().snapshot();
+        match crate::vault::mask::mask_serde(&masker, msg) {
+            Ok(m) => m,
+            Err(m) => {
+                tracing::error!("vault: a CLI message could not be masked; passing it unmasked");
+                m
+            }
+        }
+    }
 
     /// Convert a Nexus SDK `Message` to a list of `ChatEvent`s
     pub fn message_to_events(msg: &Message) -> Vec<ChatEvent> {
@@ -4136,6 +4200,9 @@ impl ChatManager {
                             }
                         };
 
+                        // Secrets first: everything below (deltas, events,
+                        // persistence, NATS, memory) reads the masked message.
+                        let result = result.map(Self::mask_cli_message);
                         match result {
                             Ok(ref msg) => {
                                 // Track the current parent_tool_use_id from every stream message.

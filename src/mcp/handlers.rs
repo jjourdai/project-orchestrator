@@ -174,6 +174,7 @@ impl ToolHandler {
             "constraint",
             "release",
             "environment",
+            "vault",
             "milestone",
             "commit",
             "note",
@@ -322,6 +323,8 @@ impl ToolHandler {
             ("release", "remove_commit") => "remove_commit_from_release",
 
             // Environment / Deployment
+            ("vault", "list_available") => "vault_list_available",
+            ("vault", "request_secret") => "vault_request_secret",
             ("environment", "list") => "list_environments",
             ("environment", "create") => "create_environment",
             ("environment", "get") => "get_environment",
@@ -2092,6 +2095,28 @@ impl ToolHandler {
             }
 
             // ── Environments & deployments ─────────────────────────────
+            "vault_list_available" => Ok(Some(
+                http.vault_call(reqwest::Method::GET, "/api/vault/agent/available", None)
+                    .await?,
+            )),
+
+            "vault_request_secret" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("`name` is required"))?;
+                let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                let body = json!({"name": name, "reason": reason});
+                Ok(Some(
+                    http.vault_call(
+                        reqwest::Method::POST,
+                        "/api/vault/agent/requests",
+                        Some(&body),
+                    )
+                    .await?,
+                ))
+            }
+
             "list_environments" => {
                 let project_id = extract_id(args, "project_id")?;
                 let result = http

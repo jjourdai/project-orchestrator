@@ -27,6 +27,7 @@ use super::sharing_handlers;
 use super::skill_handlers;
 use super::trajectory_handlers;
 use super::trigger_handlers;
+use super::vault_handlers;
 use super::workspace_handlers;
 use super::ws_chat_handler;
 use super::ws_handlers;
@@ -457,6 +458,33 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/projects/{project_id}/releases",
             get(handlers::list_releases).post(handlers::create_release),
+        )
+        // Secrets vault (user side: a person's token; agent side: vault token)
+        .route("/api/vault", get(vault_handlers::get_vault))
+        .route("/api/vault/init", post(vault_handlers::init_vault))
+        .route("/api/vault/unlock", post(vault_handlers::unlock_vault))
+        .route("/api/vault/lock", post(vault_handlers::lock_vault))
+        .route(
+            "/api/vault/secrets/{name}",
+            axum::routing::put(vault_handlers::put_secret).delete(vault_handlers::delete_secret),
+        )
+        .route("/api/vault/grants", post(vault_handlers::create_grant))
+        .route(
+            "/api/vault/grants/{id}",
+            delete(vault_handlers::revoke_grant),
+        )
+        .route(
+            "/api/vault/requests/{id}/answer",
+            post(vault_handlers::answer_request),
+        )
+        .route("/api/vault/agent/read", post(vault_handlers::agent_read))
+        .route(
+            "/api/vault/agent/requests",
+            post(vault_handlers::agent_request),
+        )
+        .route(
+            "/api/vault/agent/available",
+            get(vault_handlers::agent_available),
         )
         // Environments & deployments
         .route(
@@ -1945,6 +1973,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         create_router(state)
     }
@@ -1982,6 +2011,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         create_router(state)
     }
@@ -2165,6 +2195,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         create_router(state)
     }

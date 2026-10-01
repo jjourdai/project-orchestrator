@@ -92,6 +92,8 @@ pub struct ServerState {
     /// stale-while-revalidate cache). Always initialized; falls back to a
     /// static list when no Anthropic API key is configured.
     pub model_catalog: Arc<crate::chat::model_catalog::ModelCatalogCache>,
+    /// The secrets vault (locked at start; see `crate::vault`).
+    pub vault: Arc<crate::vault::VaultService>,
 }
 
 /// Shared orchestrator state
@@ -6473,6 +6475,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         (create_router(state), milestone.id, task1.id, task2.id)
     }
@@ -6727,6 +6730,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         }
     }
 
@@ -6889,6 +6893,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         create_router(state)
     }
@@ -7685,6 +7690,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         (create_router(state), plan.id, task1.id, task2.id)
     }
@@ -7796,6 +7802,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -7974,6 +7981,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -8026,6 +8034,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -8117,6 +8126,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         })
     }
 
@@ -8350,6 +8360,7 @@ mod tests {
             ),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         (state, project, graph)
     }

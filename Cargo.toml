@@ -122,6 +122,11 @@ glob = "0.3"
 sha2 = "0.11"
 hmac = "0.13"
 hex = "0.4"
+# Vault (src/vault): Argon2id derives a key from the user's passphrase,
+# XChaCha20-Poly1305 seals each secret, zeroize wipes keys from memory.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive", "serde"] }
 # Release version comparison (self-update checker)
 semver = "1"
 rayon = "1.10"

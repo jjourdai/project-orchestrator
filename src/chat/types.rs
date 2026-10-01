@@ -641,6 +641,21 @@ pub enum ChatEvent {
         /// render the toolbar accordingly (no pill).
         tasks: Vec<BackgroundTaskInfo>,
     },
+    /// The agent asked the user for a secret (MCP `vault.request_secret`).
+    /// The frontend shows a secure input card; the value goes straight to
+    /// the vault API, never through the chat. Ephemeral — pending requests are
+    /// re-read from `GET /api/vault/requests` on reconnect.
+    SecretRequest {
+        id: String,
+        name: String,
+        reason: String,
+        /// The secret already exists: the card offers to grant it instead of
+        /// asking the value again.
+        exists: bool,
+    },
+    /// A secret request was answered (`provided`, `granted` or `declined`).
+    /// Carries no value.
+    SecretRequestResolved { id: String, outcome: String },
 }
 
 impl ChatEvent {
@@ -677,6 +692,8 @@ impl ChatEvent {
             ChatEvent::SessionError { .. } => "session_error",
             ChatEvent::ToolsCancelled { .. } => "tools_cancelled",
             ChatEvent::ActiveTasksUpdate { .. } => "active_tasks_update",
+            ChatEvent::SecretRequest { .. } => "secret_request",
+            ChatEvent::SecretRequestResolved { .. } => "secret_request_resolved",
         }
     }
 
@@ -840,7 +857,9 @@ impl ChatEvent {
             // useful state changes from the frontend). Plan 754a1379, T4.
             ChatEvent::StreamDelta { .. }
             | ChatEvent::StreamingStatus { .. }
-            | ChatEvent::ActiveTasksUpdate { .. } => None,
+            | ChatEvent::ActiveTasksUpdate { .. }
+            | ChatEvent::SecretRequest { .. }
+            | ChatEvent::SecretRequestResolved { .. } => None,
         }
     }
 }

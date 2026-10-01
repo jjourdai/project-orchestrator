@@ -47,6 +47,7 @@ pub mod skills;
 pub mod transport;
 pub mod update;
 pub(crate) mod utils;
+pub mod vault;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -1433,6 +1434,21 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         w
     };
 
+    // Secrets vault — always LOCKED at start: the server cannot open it alone.
+    let vault = match vault::VaultService::open(
+        vault::Vault::default_path(),
+        vault::crypto::KdfParams::default(),
+        vault::mask::global().clone(),
+    ) {
+        Ok(v) => Arc::new(v),
+        Err(e) => {
+            // A malformed vault file must not take the server down; the vault
+            // API then reports it and nothing can be read.
+            tracing::error!("Secrets vault unavailable: {e}");
+            vault::VaultService::unavailable(e.to_string())
+        }
+    };
+
     // Create chat manager (optional — requires Claude CLI)
     let chat_manager = {
         let mut chat_config = chat::ChatConfig::from_env();
@@ -1490,7 +1506,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             chat_config,
         )
         .await
-        .with_event_emitter(event_bus.clone());
+        .with_event_emitter(event_bus.clone())
+        .with_vault(vault.clone());
         // Pass config.yaml path so permission changes can be persisted to disk
         if let Some(ref yaml_path) = config.config_yaml_path {
             cm = cm.with_config_yaml_path(yaml_path.clone());
@@ -1774,6 +1791,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             catalog_emitter,
             catalog_graph,
         ),
+        vault: vault.clone(),
     });
 
     // ── EventReactor: build, register built-in reactions, and spawn ──

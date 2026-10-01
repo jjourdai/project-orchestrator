@@ -1524,6 +1524,19 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             },
         ],
     },
+    // ── Secrets ─────────────────────────────────────────────────────
+    ToolGroup {
+        name: "secrets",
+        description: "Ask the user for a secret and use it without seeing it (vault)",
+        keywords: &[
+            "secret", "password", "mot de passe", "passphrase", "token", "jeton", "api key",
+            "clé api", "credential", "identifiant", "login", "vault", "coffre",
+        ],
+        tools: &[ToolRef {
+            name: "vault",
+            description: "Secrets vault for agents (list_available/request_secret) — use values only via `orchestrator secret exec|get` in the shell",
+        }],
+    },
     // ── Workspace ───────────────────────────────────────────────────
     ToolGroup {
         name: "workspace",
@@ -2984,11 +2997,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_29_mega_tools() {
+    fn test_tool_groups_cover_all_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 30,
-            "TOOL_GROUPS must cover exactly 30 unique mega-tools (got {}). \
+            count, 31,
+            "TOOL_GROUPS must cover exactly 31 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -3058,7 +3071,7 @@ mod tests {
 
     #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 15, "Expected 15 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 16, "Expected 16 tool groups");
     }
 
     #[test]

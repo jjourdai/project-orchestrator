@@ -20,6 +20,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         constraint_tool(),
         release_tool(),
         environment_tool(),
+        vault_tool(),
         milestone_tool(),
         commit_tool(),
         note_tool(),
@@ -606,6 +607,26 @@ fn environment_tool() -> ToolDefinition {
                 "finished_at": {"type": "string", "description": "Finish time ISO (update_deployment); auto-set on terminal status"},
                 "limit": {"type": "integer", "description": "Max results (list_deployments)"},
                 "offset": {"type": "integer", "description": "Offset (list_deployments)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
+fn vault_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "vault".to_string(),
+        description: "Use the user's secrets vault without ever seeing a value. Actions: list_available (names + whether this session may read each; never values), request_secret (ask the user for a secret: a secure input card appears in the chat — then END YOUR TURN and wait; you are told when it is available). To USE a granted secret, run it in the shell so the value never enters your context: `orchestrator secret exec -e VAR=NAME -- cmd args` (preferred), or `orchestrator secret get NAME | cmd --password-stdin`. Never echo or print a secret.".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["list_available", "request_secret"],
+                    "description": "Operation to perform"
+                },
+                "name": {"type": "string", "description": "Secret name, 1-64 chars of letters, digits, _ - . (request_secret)"},
+                "reason": {"type": "string", "description": "Why you need it, shown to the user on the card (request_secret)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -1471,8 +1492,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            30,
-            "Expected 30 mega-tools, got {}",
+            31,
+            "Expected 31 mega-tools, got {}",
             tools.len()
         );
     }

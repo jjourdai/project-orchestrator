@@ -2009,6 +2009,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         create_router(state)
     }
@@ -2095,6 +2096,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         (create_router(state), milestone_id, task1.id, task2.id)
     }
@@ -2493,6 +2495,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2552,6 +2555,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2607,6 +2611,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2662,6 +2667,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2711,6 +2717,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2760,6 +2767,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2807,6 +2815,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2899,6 +2908,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2953,6 +2963,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -3005,6 +3016,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -3057,6 +3069,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -3116,6 +3129,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -3168,6 +3182,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
