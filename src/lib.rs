@@ -95,7 +95,7 @@ pub struct YamlConfig {
     pub nats: NatsYamlConfig,
     pub chat: ChatYamlConfig,
     pub embeddings: EmbeddingsYamlConfig,
-    /// Auth section — if absent, auth_config will be None (deny-by-default)
+    /// Auth section — if absent, auth_config will be None (anonymous/open access)
     pub auth: Option<AuthConfig>,
     /// Skill registry section (optional — enables cross-instance skill sharing)
     #[serde(default)]
@@ -685,7 +685,7 @@ pub struct Config {
     pub nats_url: Option<String>,
     pub workspace_path: String,
     pub server_port: u16,
-    /// Auth config — None means deny-by-default (no auth section in YAML)
+    /// Auth config — None means anonymous/open access (no auth section in YAML); a WARN is logged at startup
     pub auth_config: Option<AuthConfig>,
     /// Whether to serve the frontend static files (default: true)
     pub serve_frontend: bool,
@@ -2037,6 +2037,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Create router
     let app = api::create_router(server_state);
 
+    if let Some(warning) = anonymous_mode_warning(config.auth_config.is_some(), &addr) {
+        tracing::warn!("{warning}");
+    }
+
     // Log frontend serving mode
     if config.serve_frontend {
         tracing::info!("Frontend serving enabled — path: {}", config.frontend_path);
@@ -2054,7 +2058,11 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
     // Start serving. The port was bound at the top of `start_server`.
     tracing::info!("Server listening on {}", addr);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -2160,6 +2168,35 @@ async fn start_setup_server(port: u16) -> Result<()> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// Startup warning for anonymous mode, or `None` when auth is configured.
+///
+/// The listener is always bound on 0.0.0.0, so anonymous mode is reachable
+/// from the network, not just loopback.
+fn anonymous_mode_warning(auth_configured: bool, addr: &std::net::SocketAddr) -> Option<String> {
+    if auth_configured {
+        return None;
+    }
+    Some(format!(
+        "AUTH DISABLED: no `auth` section configured — every API request is served \
+         anonymously. The server listens on {addr} (all interfaces), so anyone who can \
+         reach this port has full access. Configure `auth` (root_account or oidc) \
+         before exposing this host beyond a trusted machine."
+    ))
+}
+
+#[cfg(test)]
+mod anonymous_warning_tests {
+    use super::*;
+
+    #[test]
+    fn warns_only_when_auth_is_not_configured() {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 6600));
+        let msg = anonymous_mode_warning(false, &addr).expect("must warn");
+        assert!(msg.contains("AUTH DISABLED") && msg.contains("0.0.0.0:6600"));
+        assert!(anonymous_mode_warning(true, &addr).is_none());
+    }
+}
 
 #[cfg(test)]
 mod config_tests {

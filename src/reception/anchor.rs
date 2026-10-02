@@ -27,23 +27,28 @@ pub struct SignedTombstone {
     pub content_hash: String,
     /// DID of the issuer who signed this tombstone.
     pub issuer_did: String,
-    /// Hex-encoded Ed25519 signature over the content hash.
+    /// Hex-encoded Ed25519 signature over the domain-separated payload
+    /// (`po-tombstone-v1`: content hash, issuer, issued_at, reason).
     pub signature_hex: String,
     /// When the tombstone was issued.
     pub issued_at: DateTime<Utc>,
-    /// Optional human-readable reason for revocation.
+    /// Optional human-readable reason for revocation (covered by the signature).
     pub reason: Option<String>,
 }
 
 /// Tombstone registry for revoked content hashes.
 ///
 /// Stores [`SignedTombstone`] entries keyed by content hash.
-/// Backward-compatible: the legacy `apply_tombstone` / `is_revoked` API
-/// still works by creating unsigned placeholder tombstones internally.
+/// Tombstones MUST go through `apply_signed_tombstone`, which checks the
+/// signature AND that the issuer is the known original owner of the content
+/// (registered with `register_owner` / `register_envelope_owner`). The unsigned
+/// `apply_tombstone` is test-only.
 #[derive(Debug, Clone, Default)]
 pub struct TombstoneRegistry {
     /// Map of content hashes to their signed tombstone records.
     revoked: HashMap<String, SignedTombstone>,
+    /// Known original owner (DID) per content hash.
+    owners: HashMap<String, String>,
 }
 
 impl TombstoneRegistry {
@@ -51,13 +56,48 @@ impl TombstoneRegistry {
     pub fn new() -> Self {
         Self {
             revoked: HashMap::new(),
+            owners: HashMap::new(),
         }
     }
 
-    /// Apply a tombstone for the given content hash (legacy/unsigned).
+    /// Record the original owner of a content hash (first registration wins,
+    /// so a later envelope cannot re-attribute known content).
+    pub fn register_owner(&mut self, content_hash: &str, owner_did: &str) {
+        self.owners
+            .entry(content_hash.to_string())
+            .or_insert_with(|| owner_did.to_string());
+    }
+
+    /// Record the owner of an envelope's content: its `trust_proof.source_did`,
+    /// but ONLY once the envelope has passed [`verify_envelope`] (Ed25519
+    /// signature by that DID over the content hash, and content integrity).
     ///
-    /// Returns `true` if the tombstone was newly applied, `false` if already present.
-    pub fn apply_tombstone(&mut self, content_hash: &str) -> bool {
+    /// Fail-closed: an unverifiable envelope registers nothing. Without this
+    /// check anyone could forge an envelope for a known content hash, win the
+    /// first-registration race and then revoke the victim's content.
+    ///
+    /// [`verify_envelope`]: crate::reception::verify::verify_envelope
+    pub fn register_envelope_owner(
+        &mut self,
+        envelope: &crate::episodes::distill_models::DistillationEnvelope,
+    ) -> Result<(), String> {
+        let verified = crate::reception::verify::verify_envelope(envelope)
+            .map_err(|e| format!("envelope not verified, owner not registered: {e}"))?;
+        self.register_owner(&verified.envelope.meta.content_hash, &verified.source_did);
+        Ok(())
+    }
+
+    /// Known owner of a content hash, if any.
+    pub fn owner_of(&self, content_hash: &str) -> Option<&str> {
+        self.owners.get(content_hash).map(String::as_str)
+    }
+
+    /// Apply a tombstone for the given content hash (unsigned, test-only).
+    ///
+    /// Bypasses signature and authority checks, so it is not available outside
+    /// tests. Returns `true` if newly applied, `false` if already present.
+    #[cfg(test)]
+    pub(crate) fn apply_tombstone(&mut self, content_hash: &str) -> bool {
         if self.revoked.contains_key(content_hash) {
             return false;
         }
@@ -72,14 +112,23 @@ impl TombstoneRegistry {
         true
     }
 
-    /// Apply a signed tombstone. Returns `true` if it was newly inserted.
-    pub fn apply_signed_tombstone(&mut self, tombstone: SignedTombstone) -> bool {
+    /// Apply a signed tombstone after verifying its Ed25519 signature and that
+    /// its issuer is the known owner of the content (fail-closed).
+    ///
+    /// Returns `Err` if the signature does not verify, the owner is unknown or
+    /// the issuer is not the owner; `Ok(true)` if newly inserted, `Ok(false)`
+    /// if already present.
+    pub fn apply_signed_tombstone(&mut self, tombstone: SignedTombstone) -> Result<bool, String> {
+        crate::sharing::tombstone::verify_tombstone_authority(
+            &tombstone,
+            self.owner_of(&tombstone.content_hash),
+        )?;
         if self.revoked.contains_key(&tombstone.content_hash) {
-            return false;
+            return Ok(false);
         }
         self.revoked
             .insert(tombstone.content_hash.clone(), tombstone);
-        true
+        Ok(true)
     }
 
     /// Check if a content hash has been tombstoned.
@@ -211,16 +260,45 @@ mod tests {
     #[test]
     fn test_signed_tombstone_apply() {
         let mut registry = TombstoneRegistry::new();
-        let tombstone = SignedTombstone {
-            content_hash: "hash_signed".to_string(),
-            issuer_did: "did:key:zIssuer".to_string(),
-            signature_hex: "abcd1234".to_string(),
-            issued_at: chrono::Utc::now(),
-            reason: Some("GDPR request".to_string()),
-        };
-        assert!(registry.apply_signed_tombstone(tombstone.clone()));
-        assert!(!registry.apply_signed_tombstone(tombstone)); // duplicate
+        let id = crate::identity::InstanceIdentity::generate();
+        registry.register_owner("hash_signed", id.did_key());
+        let tombstone = crate::sharing::tombstone::sign_tombstone(
+            &id,
+            "hash_signed".to_string(),
+            chrono::Utc::now(),
+            Some("GDPR request".to_string()),
+        );
+        assert_eq!(registry.apply_signed_tombstone(tombstone.clone()), Ok(true));
+        assert_eq!(registry.apply_signed_tombstone(tombstone), Ok(false)); // duplicate
         assert!(registry.is_revoked("hash_signed"));
+    }
+
+    #[test]
+    fn test_forged_tombstone_rejected() {
+        let mut registry = TombstoneRegistry::new();
+        let forged = SignedTombstone {
+            content_hash: "hash_forged".to_string(),
+            issuer_did: "did:key:zIssuer".to_string(),
+            signature_hex: "0".repeat(128),
+            issued_at: chrono::Utc::now(),
+            reason: None,
+        };
+        assert!(registry.apply_signed_tombstone(forged).is_err());
+        assert!(!registry.is_revoked("hash_forged"));
+
+        // Valid signature by key A, claimed by issuer B
+        let a = crate::identity::InstanceIdentity::generate();
+        let b = crate::identity::InstanceIdentity::generate();
+        registry.register_owner("hash_forged2", b.did_key());
+        let mut t = crate::sharing::tombstone::sign_tombstone(
+            &a,
+            "hash_forged2".to_string(),
+            chrono::Utc::now(),
+            None,
+        );
+        t.issuer_did = b.did_key().to_string();
+        assert!(registry.apply_signed_tombstone(t).is_err());
+        assert!(!registry.is_revoked("hash_forged2"));
     }
 
     #[test]
@@ -228,18 +306,20 @@ mod tests {
         let mut registry = TombstoneRegistry::new();
         assert!(registry.get_tombstone("missing").is_none());
 
-        let tombstone = SignedTombstone {
-            content_hash: "hash_get".to_string(),
-            issuer_did: "did:key:zAlice".to_string(),
-            signature_hex: "beef".to_string(),
-            issued_at: chrono::Utc::now(),
-            reason: None,
-        };
-        registry.apply_signed_tombstone(tombstone);
+        let id = crate::identity::InstanceIdentity::generate();
+        registry.register_owner("hash_get", id.did_key());
+        let tombstone = crate::sharing::tombstone::sign_tombstone(
+            &id,
+            "hash_get".to_string(),
+            chrono::Utc::now(),
+            None,
+        );
+        let sig = tombstone.signature_hex.clone();
+        registry.apply_signed_tombstone(tombstone).unwrap();
 
         let retrieved = registry.get_tombstone("hash_get").unwrap();
-        assert_eq!(retrieved.issuer_did, "did:key:zAlice");
-        assert_eq!(retrieved.signature_hex, "beef");
+        assert_eq!(retrieved.issuer_did, id.did_key());
+        assert_eq!(retrieved.signature_hex, sig);
         assert!(retrieved.reason.is_none());
     }
 
@@ -249,13 +329,16 @@ mod tests {
         assert!(registry.list_tombstones().is_empty());
 
         registry.apply_tombstone("hash_a");
-        registry.apply_signed_tombstone(SignedTombstone {
-            content_hash: "hash_b".to_string(),
-            issuer_did: "did:key:zBob".to_string(),
-            signature_hex: "cafe".to_string(),
-            issued_at: chrono::Utc::now(),
-            reason: Some("test".to_string()),
-        });
+        let id = crate::identity::InstanceIdentity::generate();
+        registry.register_owner("hash_b", id.did_key());
+        registry
+            .apply_signed_tombstone(crate::sharing::tombstone::sign_tombstone(
+                &id,
+                "hash_b".to_string(),
+                chrono::Utc::now(),
+                Some("test".to_string()),
+            ))
+            .unwrap();
 
         assert_eq!(registry.list_tombstones().len(), 2);
     }
@@ -285,5 +368,141 @@ mod tests {
         assert_eq!(deser.content_hash, "hash_ser");
         assert_eq!(deser.issuer_did, "did:key:zTest");
         assert_eq!(deser.reason.as_deref(), Some("privacy"));
+    }
+
+    #[test]
+    fn test_wrong_issuer_valid_signature_rejected() {
+        let mut registry = TombstoneRegistry::new();
+        let owner = crate::identity::InstanceIdentity::generate();
+        let attacker = crate::identity::InstanceIdentity::generate();
+        registry.register_owner("hash_owned", owner.did_key());
+        let t = crate::sharing::tombstone::sign_tombstone(
+            &attacker,
+            "hash_owned".to_string(),
+            chrono::Utc::now(),
+            None,
+        );
+        assert!(registry.apply_signed_tombstone(t).is_err());
+        assert!(!registry.is_revoked("hash_owned"));
+    }
+
+    #[test]
+    fn test_unknown_owner_rejected() {
+        let mut registry = TombstoneRegistry::new();
+        let id = crate::identity::InstanceIdentity::generate();
+        let t = crate::sharing::tombstone::sign_tombstone(
+            &id,
+            "hash_nobody".to_string(),
+            chrono::Utc::now(),
+            None,
+        );
+        assert!(registry.apply_signed_tombstone(t).is_err());
+        assert!(!registry.is_revoked("hash_nobody"));
+    }
+
+    #[test]
+    fn test_altered_reason_rejected_by_registry() {
+        let mut registry = TombstoneRegistry::new();
+        let id = crate::identity::InstanceIdentity::generate();
+        registry.register_owner("hash_reason", id.did_key());
+        let mut t = crate::sharing::tombstone::sign_tombstone(
+            &id,
+            "hash_reason".to_string(),
+            chrono::Utc::now(),
+            Some("original".into()),
+        );
+        t.reason = Some("altered".into());
+        assert!(registry.apply_signed_tombstone(t).is_err());
+    }
+
+    #[test]
+    fn test_owner_registration_first_wins() {
+        let mut registry = TombstoneRegistry::new();
+        registry.register_owner("h", "did:key:zA");
+        registry.register_owner("h", "did:key:zB");
+        assert_eq!(registry.owner_of("h"), Some("did:key:zA"));
+    }
+
+    /// Build an envelope whose content hash is the real digest of its lesson,
+    /// with `signer` producing the trust-proof signature and `claimed_did`
+    /// as the declared source.
+    fn make_envelope(
+        signer: &crate::identity::InstanceIdentity,
+        claimed_did: &str,
+    ) -> crate::episodes::distill_models::DistillationEnvelope {
+        use crate::episodes::distill_models::{
+            DistillationEnvelope, DistillationMeta, DistilledLesson, SensitivityLevel, TrustProof,
+        };
+        use sha2::{Digest, Sha256};
+        let lesson = DistilledLesson {
+            abstract_pattern: "Validate inputs".to_string(),
+            domain_tags: vec!["rust".to_string()],
+            portability_layer: PortabilityLayer::Domain,
+            confidence: 0.9,
+        };
+        let content_hash = hex::encode(Sha256::digest(
+            serde_json::to_string(&lesson).unwrap().as_bytes(),
+        ));
+        let sig = signer.sign(content_hash.as_bytes());
+        DistillationEnvelope {
+            lesson,
+            anonymized_content: "x".to_string(),
+            meta: DistillationMeta {
+                pipeline_version: "1.0".to_string(),
+                sensitivity_level: SensitivityLevel::Public,
+                quality_score: 0.8,
+                content_hash,
+            },
+            trust_proof: TrustProof {
+                source_did: claimed_did.to_string(),
+                signature_hex: hex::encode(sig.to_bytes()),
+                trust_scores: HashMap::new(),
+            },
+            anonymization_report: None,
+        }
+    }
+
+    #[test]
+    fn test_forged_envelope_does_not_register_owner() {
+        let victim = crate::identity::InstanceIdentity::generate();
+        let attacker = crate::identity::InstanceIdentity::generate();
+        // Attacker claims the content under their own DID but cannot produce
+        // a valid signature for it: signs with the victim-unrelated key while
+        // declaring a different DID.
+        let victim_env = make_envelope(&victim, victim.did_key());
+        let mut forged = victim_env.clone();
+        forged.trust_proof.source_did = attacker.did_key().to_string();
+        // signature is the victim's, DID is the attacker's: must not verify.
+
+        let mut registry = TombstoneRegistry::new();
+        let _ = registry.register_envelope_owner(&forged);
+        assert_eq!(registry.owner_of(&forged.meta.content_hash), None);
+
+        // Attacker-signed tombstone is refused (no owner known, fail-closed).
+        let t = crate::sharing::tombstone::sign_tombstone(
+            &attacker,
+            forged.meta.content_hash.clone(),
+            chrono::Utc::now(),
+            None,
+        );
+        assert!(registry.apply_signed_tombstone(t).is_err());
+        assert!(!registry.is_revoked(&forged.meta.content_hash));
+
+        // The genuine envelope still registers the real owner afterwards.
+        registry.register_envelope_owner(&victim_env).unwrap();
+        assert_eq!(
+            registry.owner_of(&victim_env.meta.content_hash),
+            Some(victim.did_key())
+        );
+    }
+
+    #[test]
+    fn test_envelope_with_tampered_content_does_not_register_owner() {
+        let id = crate::identity::InstanceIdentity::generate();
+        let mut env = make_envelope(&id, id.did_key());
+        env.lesson.abstract_pattern = "tampered".to_string();
+        let mut registry = TombstoneRegistry::new();
+        assert!(registry.register_envelope_owner(&env).is_err());
+        assert_eq!(registry.owner_of(&env.meta.content_hash), None);
     }
 }

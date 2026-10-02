@@ -8,8 +8,8 @@ use crate::episodes::distill_models::{
     ConsentStats, PrivacyMode, SharingConsent, SharingEvent, SharingMode, SharingPolicy,
 };
 use crate::notes::NoteFilters;
-use crate::reception::anchor::SignedTombstone;
 use crate::sharing::consent_gate::run_consent_gate;
+use crate::sharing::tombstone::AnnotatedTombstone;
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -388,18 +388,19 @@ pub async fn retract_sharing(
         ));
     };
 
-    // Build and persist tombstone
-    let tombstone = SignedTombstone {
-        content_hash: content_hash.clone(),
-        issuer_did: state
-            .identity
-            .as_ref()
-            .map(|id| id.did_key().to_string())
-            .unwrap_or_else(|| "did:local:unknown".to_string()),
-        signature_hex: "0".repeat(128), // placeholder — real signing requires InstanceIdentity
-        issued_at: Utc::now(),
-        reason: body.reason.clone(),
-    };
+    // Build and persist a really signed tombstone. Without an instance
+    // identity we cannot sign: refuse instead of persisting a fake signature.
+    let identity = state.identity.as_ref().ok_or_else(|| {
+        AppError::NotImplemented(
+            "tombstone signing requires an instance identity (none configured)".into(),
+        )
+    })?;
+    let tombstone = crate::sharing::tombstone::sign_tombstone(
+        identity,
+        content_hash.clone(),
+        Utc::now(),
+        body.reason.clone(),
+    );
 
     state
         .orchestrator
@@ -450,7 +451,7 @@ pub async fn retract_sharing(
 pub async fn list_tombstones(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
-) -> Result<Json<Vec<SignedTombstone>>, AppError> {
+) -> Result<Json<Vec<AnnotatedTombstone>>, AppError> {
     // Validate project exists
     let _project_id = resolve_project_id(&state, &slug).await?;
 
@@ -461,7 +462,13 @@ pub async fn list_tombstones(
         .await
         .map_err(AppError::Internal)?;
 
-    Ok(Json(tombstones))
+    // Mark legacy placeholders (fake signature) and unverifiable entries explicitly.
+    Ok(Json(
+        tombstones
+            .into_iter()
+            .map(crate::sharing::tombstone::annotate_tombstone)
+            .collect(),
+    ))
 }
 
 /// GET /api/projects/{slug}/sharing/last-report — last privacy/consent report
@@ -541,6 +548,11 @@ mod tests {
 
     /// Build an app with a pre-seeded project so sharing endpoints find it.
     async fn test_app_with_project() -> (axum::Router, String) {
+        test_app_with_project_identity(true).await
+    }
+
+    /// `with_identity = false` models an instance that cannot sign tombstones.
+    async fn test_app_with_project_identity(with_identity: bool) -> (axum::Router, String) {
         let app_state = mock_app_state();
         let project = test_project();
         let slug = project.slug.clone();
@@ -571,7 +583,8 @@ mod tests {
             trajectory_collector: std::sync::RwLock::new(None),
             trajectory_store_neo4j: None,
             trajectory_store: None,
-            identity: None,
+            identity: with_identity
+                .then(|| Arc::new(crate::identity::InstanceIdentity::generate())),
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
@@ -956,6 +969,15 @@ mod tests {
         assert_eq!(json["content_hash"], "sha256:deadbeef");
         assert_eq!(json["tombstone_persisted"], true);
         assert_eq!(json["event_recorded"], true);
+    }
+
+    #[tokio::test]
+    async fn test_retract_without_identity_is_refused_not_faked() {
+        let (app, slug) = test_app_with_project_identity(false).await;
+        let uri = format!("/api/projects/{}/sharing/retract", slug);
+        let body = serde_json::json!({ "content_hash": "sha256:deadbeef" });
+        let resp = app.oneshot(auth_post(&uri, body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
