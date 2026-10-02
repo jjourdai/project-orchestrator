@@ -32,10 +32,7 @@ impl Neo4jClient {
         )
         .param("plan_id", plan_id.to_string())
         .param("id", constraint.id.to_string())
-        .param(
-            "constraint_type",
-            format!("{:?}", constraint.constraint_type).to_lowercase(),
-        )
+        .param("constraint_type", constraint.constraint_type.to_string())
         .param("description", constraint.description.clone())
         .param(
             "enforced_by",
@@ -200,10 +197,7 @@ impl Neo4jClient {
             q = q.param("description", description);
         }
         if let Some(constraint_type) = constraint_type {
-            q = q.param(
-                "constraint_type",
-                format!("{:?}", constraint_type).to_lowercase(),
-            );
+            q = q.param("constraint_type", constraint_type.to_string());
         }
         if let Some(enforced_by) = enforced_by {
             q = q.param("enforced_by", enforced_by);
