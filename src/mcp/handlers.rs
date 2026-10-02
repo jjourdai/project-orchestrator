@@ -68,40 +68,102 @@ fn resolve_intent_profile(
     }
 }
 
-/// Fix stringified JSON values from MCP transport.
+/// Fix stringified JSON values from MCP transport, guided by the tool schema.
 ///
 /// Claude Code sometimes sends array/integer/boolean parameters as JSON strings
 /// (e.g. `"[\"a\"]"` instead of `["a"]`, `"100"` instead of `100`).
-/// This function detects and deserializes them back to proper JSON types.
-fn unstringify_json_values(args: &mut Value) {
-    let obj = match args.as_object_mut() {
-        Some(o) => o,
-        None => return,
+/// A string is only converted when the tool's published input schema declares
+/// that parameter as a non-string type; parameters declared as strings, or not
+/// declared at all, are left verbatim (so `"007"` or `"true"` survive as titles).
+fn unstringify_json_values(args: &mut Value, properties: Option<&Value>) {
+    let (Some(obj), Some(props)) = (args.as_object_mut(), properties) else {
+        return;
     };
-    for (_key, val) in obj.iter_mut() {
-        if let Some(s) = val.as_str().map(|s| s.to_owned()) {
-            let trimmed = s.trim();
-            if trimmed.starts_with('[') || trimmed.starts_with('{') {
-                if let Ok(parsed) = serde_json::from_str::<Value>(&s) {
-                    if parsed.is_array() || parsed.is_object() {
-                        *val = parsed;
-                        continue;
+    for (key, val) in obj.iter_mut() {
+        let Some(s) = val.as_str() else { continue };
+        let Some(declared) = props.get(key).and_then(|p| p.get("type")) else {
+            continue;
+        };
+        // A list-typed declaration such as ["array", "integer"] is resolved by the
+        // branches below in a fixed order: array/object first, then boolean, then
+        // integer/number. So a string that parses as JSON array/object becomes one,
+        // and otherwise falls through to None (it is not retried as an integer).
+        // No current schema declares such a mixed type.
+        let accepts = |t: &str| match declared {
+            Value::String(d) => d == t,
+            Value::Array(ds) => ds.iter().any(|d| d == t),
+            _ => false,
+        };
+        if accepts("string") {
+            continue;
+        }
+        let trimmed = s.trim();
+        let converted = if accepts("array") || accepts("object") {
+            serde_json::from_str::<Value>(trimmed).ok().filter(|p| {
+                (p.is_array() && accepts("array")) || (p.is_object() && accepts("object"))
+            })
+        } else if accepts("boolean") && trimmed == "true" {
+            Some(Value::Bool(true))
+        } else if accepts("boolean") && trimmed == "false" {
+            Some(Value::Bool(false))
+        } else if accepts("integer") || accepts("number") {
+            trimmed
+                .parse::<i64>()
+                .ok()
+                .map(|n| Value::Number(n.into()))
+                .or_else(|| {
+                    if accepts("number") {
+                        trimmed
+                            .parse::<f64>()
+                            .ok()
+                            .and_then(serde_json::Number::from_f64)
+                            .map(Value::Number)
+                    } else {
+                        None
                     }
-                }
-            }
-            if trimmed == "true" {
-                *val = Value::Bool(true);
-                continue;
-            }
-            if trimmed == "false" {
-                *val = Value::Bool(false);
-                continue;
-            }
-            if let Ok(n) = trimmed.parse::<i64>() {
-                *val = Value::Number(n.into());
-            }
+                })
+        } else {
+            None
+        };
+        if let Some(c) = converted {
+            *val = c;
         }
     }
+}
+
+/// Mega-tool that owns `tool`: the name itself when it is a mega-tool, otherwise
+/// the mega-tool of a legacy name. Both dispatch tables are consulted, because
+/// `resolve_legacy_alias` does not know every legacy name that
+/// `MEGA_TOOL_ACTIONS` (the table the dispatcher routes with) accepts.
+fn mega_tool_for(tool: &str) -> &str {
+    if let Some((mega, _)) = super::tools::resolve_legacy_alias(tool) {
+        return mega;
+    }
+    MEGA_TOOL_ACTIONS
+        .iter()
+        .find(|(_, _, internal)| *internal == tool)
+        .map(|(mega, _, _)| *mega)
+        .unwrap_or(tool)
+}
+
+/// Declared input properties of the mega-tool that owns `tool`.
+fn declared_properties_for_tool(tool: &str) -> Option<&'static Value> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static SCHEMAS: OnceLock<HashMap<String, Value>> = OnceLock::new();
+    let schemas = SCHEMAS.get_or_init(|| {
+        super::tools::all_tools()
+            .into_iter()
+            .filter_map(|t| t.input_schema.properties.map(|p| (t.name, p)))
+            .collect()
+    });
+    schemas.get(mega_tool_for(tool))
+}
+
+/// Look up the declared input properties of `tool` (mega-tool or legacy name)
+/// and apply [`unstringify_json_values`] against them.
+fn unstringify_args_for_tool(tool: &str, args: &mut Value) {
+    unstringify_json_values(args, declared_properties_for_tool(tool));
 }
 
 /// Single source of truth for mega-tool dispatch: `(mega_tool, action, internal_name)`.
@@ -679,10 +741,11 @@ impl ToolHandler {
         }
 
         // ── Mega-tool resolution ────────────────────────────────────────
+        let orig_name = name;
         let (resolved_name, resolved_args) = self.resolve_mega_tool(name, &args)?;
         let name = resolved_name.as_str();
         let mut args = resolved_args;
-        unstringify_json_values(&mut args);
+        unstringify_args_for_tool(orig_name, &mut args);
 
         // ── HTTP routing ────────────────────────────────────────────────
         let result = self.try_handle_http(name, &args).await;
@@ -10858,9 +10921,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_unstringify_respects_declared_string_type() {
+        // `title` is declared as a string: "007", "true", "[1,2]" must stay verbatim.
+        let mut v = json!({
+            "action": "create",
+            "title": "007",
+            "description": "[1,2]",
+            "priority": "100"
+        });
+        unstringify_args_for_tool("task", &mut v);
+        assert_eq!(v["title"], json!("007"));
+        assert_eq!(v["description"], json!("[1,2]"));
+        // `priority` is declared as an integer: still converted.
+        assert_eq!(v["priority"], json!(100));
+
+        let mut v = json!({"action": "create", "name": "true", "slug": "123"});
+        unstringify_args_for_tool("project", &mut v);
+        assert_eq!(v["name"], json!("true"));
+        assert_eq!(v["slug"], json!("123"));
+
+        // Unknown tool / undeclared key: left untouched.
+        let mut v = json!({"whatever": "42"});
+        unstringify_args_for_tool("no_such_tool", &mut v);
+        assert_eq!(v["whatever"], json!("42"));
+    }
+
+    #[test]
+    fn test_unstringify_covers_every_legacy_name_in_dispatch_table() {
+        // Every legacy name the dispatcher accepts (MEGA_TOOL_ACTIONS) must be
+        // coerced by the schema of its mega-tool, whether or not
+        // `resolve_legacy_alias` knows it.
+        let mut checked = 0;
+        for (mega, _action, internal) in MEGA_TOOL_ACTIONS {
+            let props = declared_properties_for_tool(internal)
+                .unwrap_or_else(|| panic!("legacy name '{internal}' lost its schema"));
+            let mega_props = declared_properties_for_tool(mega).unwrap();
+            assert!(
+                std::ptr::eq(props, mega_props),
+                "'{internal}' must resolve to the schema of '{mega}'"
+            );
+            // Any integer-typed parameter of the mega-tool must still be coerced.
+            if let Some(key) =
+                props.as_object().unwrap().iter().find_map(|(k, v)| {
+                    (v.get("type") == Some(&json!("integer"))).then(|| k.clone())
+                })
+            {
+                let mut args = json!({ key.clone(): "42" });
+                unstringify_args_for_tool(internal, &mut args);
+                assert_eq!(
+                    args[&key],
+                    json!(42),
+                    "'{internal}' lost coercion of '{key}'"
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, MEGA_TOOL_ACTIONS.len());
+        assert!(checked > 100);
+    }
+
+    #[tokio::test]
+    async fn test_handle_coerces_arguments_by_schema_for_legacy_and_mega_names() {
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        // `update_plan` is accepted by the dispatcher but unknown to
+        // `resolve_legacy_alias`; the mega-tool form resolves to the same handler.
+        let calls = [
+            (
+                "update_plan",
+                json!({"plan_id": pid, "priority": "5", "title": "007"}),
+            ),
+            (
+                "plan",
+                json!({"action": "update", "plan_id": pid, "priority": "5", "title": "007"}),
+            ),
+        ];
+        for (name, args) in calls {
+            let (handler, _) = make_http_handler().await;
+            let result = handler.handle(name, Some(args)).await.unwrap();
+            assert_eq!(result["method"], "PATCH", "{name}");
+            // priority is declared integer: coerced; title is declared string: verbatim.
+            assert_eq!(result["body"]["priority"], json!(5), "{name}");
+            assert_eq!(result["body"]["title"], json!("007"), "{name}");
+        }
+    }
+
     // ========================================================================
     // unstringify_json_values tests
     // ========================================================================
+
+    fn test_props() -> Value {
+        json!({
+            "tags": {"type": "array"},
+            "priority": {"type": "integer"},
+            "affected_files": {"type": "array"},
+            "title": {"type": "string"},
+            "flag": {"type": "boolean"},
+            "active": {"type": "boolean"},
+            "meta": {"type": "object"},
+            "ratio": {"type": "number"},
+            "name": {"type": "string"},
+            "path": {"type": "string"}
+        })
+    }
 
     #[test]
     fn test_unstringify_json_values() {
@@ -10871,7 +11034,7 @@ mod tests {
             "title": "normal string",
             "flag": "true"
         });
-        unstringify_json_values(&mut v);
+        unstringify_json_values(&mut v, Some(&test_props()));
         assert_eq!(v["tags"], json!(["a", "b"]));
         assert_eq!(v["priority"], json!(100));
         assert_eq!(v["affected_files"], json!(["src/main.rs"]));
@@ -10880,16 +11043,26 @@ mod tests {
     }
 
     #[test]
+    fn test_unstringify_json_values_number_and_wrong_shape() {
+        let mut v = json!({"ratio": "0.5", "tags": "{\"a\":1}", "priority": "abc"});
+        unstringify_json_values(&mut v, Some(&test_props()));
+        assert_eq!(v["ratio"], json!(0.5));
+        // Declared array but the string parses to an object: left as-is.
+        assert_eq!(v["tags"], json!("{\"a\":1}"));
+        assert_eq!(v["priority"], json!("abc"));
+    }
+
+    #[test]
     fn test_unstringify_json_values_false() {
         let mut v = json!({"active": "false"});
-        unstringify_json_values(&mut v);
+        unstringify_json_values(&mut v, Some(&test_props()));
         assert_eq!(v["active"], json!(false));
     }
 
     #[test]
     fn test_unstringify_json_values_object() {
         let mut v = json!({"meta": "{\"key\":\"val\"}"});
-        unstringify_json_values(&mut v);
+        unstringify_json_values(&mut v, Some(&test_props()));
         assert_eq!(v["meta"], json!({"key": "val"}));
     }
 
@@ -10897,7 +11070,7 @@ mod tests {
     fn test_unstringify_json_values_leaves_non_json_strings() {
         let mut v = json!({"name": "hello world", "path": "/tmp/foo"});
         let original = v.clone();
-        unstringify_json_values(&mut v);
+        unstringify_json_values(&mut v, Some(&test_props()));
         assert_eq!(v, original);
     }
 
@@ -10905,7 +11078,7 @@ mod tests {
     fn test_unstringify_json_values_non_object() {
         // Should not panic on non-object values
         let mut v = json!("just a string");
-        unstringify_json_values(&mut v);
+        unstringify_json_values(&mut v, Some(&test_props()));
         assert_eq!(v, json!("just a string"));
     }
 
