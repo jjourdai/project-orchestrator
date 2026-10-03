@@ -303,6 +303,7 @@ async fn execute_via_agent(
     // 1. Create a chat session
     let cwd = project_root.unwrap_or(".");
     let request = ChatRequest {
+        attachments: Vec::new(),
         message: String::new(), // sent separately via send_message
         session_id: None,
         cwd: cwd.to_string(),

@@ -990,6 +990,7 @@ pub async fn delegate_task(
 
     let chat_request_cwd = req.cwd.clone();
     let chat_request = crate::chat::types::ChatRequest {
+        attachments: Vec::new(),
         message: String::new(), // prompt sent via send_message
         session_id: None,
         cwd: req.cwd,

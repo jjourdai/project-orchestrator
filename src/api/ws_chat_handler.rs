@@ -25,6 +25,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// Query parameters for the chat WebSocket
 #[derive(Debug, Deserialize, Default)]
@@ -41,7 +42,12 @@ pub struct WsChatQuery {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsChatClientMessage {
     /// Send a new user message
-    UserMessage { content: String },
+    UserMessage {
+        content: String,
+        /// Ids of documents already uploaded through `POST /api/documents`.
+        #[serde(default)]
+        attachments: Vec<Uuid>,
+    },
     /// Interrupt the current operation
     Interrupt,
     /// Response to a permission request
@@ -717,7 +723,7 @@ async fn handle_ws_chat_loop(
                         match serde_json::from_str::<WsChatClientMessage>(text_str) {
                             Ok(client_msg) => {
                                 match client_msg {
-                                    WsChatClientMessage::UserMessage { content } => {
+                                    WsChatClientMessage::UserMessage { content, attachments } => {
                                         debug!(session_id = %session_id, "WS: Received user_message");
 
                                         // T4.3: Extract code entities and create DISCUSSED relations (non-blocking)
@@ -725,6 +731,26 @@ async fn handle_ws_chat_loop(
 
                                         // Same routing as POST /api/chat/sessions/{id}/messages:
                                         // local → remote (NATS RPC) → resume_session.
+                                        // Fold attached documents into the message text
+                                        // (see chat::message_attachments). An unknown id
+                                        // is refused, never silently dropped.
+                                        let content = match crate::chat::message_attachments::compose(
+                                            &state.orchestrator.neo4j_arc(),
+                                            &content,
+                                            &attachments,
+                                        )
+                                        .await
+                                        {
+                                            Ok(c) => c,
+                                            Err(e) => {
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": format!("Failed to attach documents: {}", e),
+                                                });
+                                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                                continue;
+                                            }
+                                        };
                                         let result = chat_manager
                                             .route_user_message(&session_id, &content, Some(&claims))
                                             .await;
@@ -1379,7 +1405,9 @@ mod tests {
         // user_message — the main one that triggers resume_session
         let msg: WsChatClientMessage =
             serde_json::from_str(r#"{"type":"user_message","content":"hello"}"#).unwrap();
-        assert!(matches!(msg, WsChatClientMessage::UserMessage { content } if content == "hello"));
+        assert!(
+            matches!(msg, WsChatClientMessage::UserMessage { content, .. } if content == "hello")
+        );
 
         // interrupt — should work even if dormant (no-op since no stream)
         let msg: WsChatClientMessage = serde_json::from_str(r#"{"type":"interrupt"}"#).unwrap();

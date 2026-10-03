@@ -2695,6 +2695,7 @@ impl PlanRunner {
             })
             .unwrap_or_default();
         let request = ChatRequest {
+            attachments: Vec::new(),
             message: prompt, // Send the full prompt directly in create_session — avoids the ghost empty message at seq 1
             session_id: None,
             cwd: cwd.to_string(),

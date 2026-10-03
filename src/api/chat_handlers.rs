@@ -46,6 +46,19 @@ pub async fn create_session(
         .as_ref()
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
 
+    // Fold attached documents into the message once, before either path: both
+    // persist and broadcast `request.message`, so the chips survive replay.
+    if !request.attachments.is_empty() {
+        request.message = crate::chat::message_attachments::compose(
+            &state.orchestrator.neo4j_arc(),
+            &request.message,
+            &request.attachments,
+        )
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        request.attachments.clear();
+    }
+
     // ── Resume path ────────────────────────────────────────────────────────
     if let Some(sid) = request.session_id.clone() {
         Uuid::parse_str(&sid)
@@ -639,6 +652,9 @@ pub struct PermissionAnswerRequest {
 #[serde(deny_unknown_fields)]
 pub struct SendMessageRequest {
     pub content: String,
+    /// Ids of documents already uploaded through `POST /api/documents`.
+    #[serde(default)]
+    pub attachments: Vec<Uuid>,
 }
 
 const PERMISSION_GONE_REASON: &str = "le CLI qui demandait s'est arrêté ; continue par un message \
@@ -757,8 +773,16 @@ pub async fn send_session_message(
     // Same side effect as the WS path.
     super::ws_chat_handler::spawn_entity_extraction(&state, &sid, &body.content);
 
+    let content = crate::chat::message_attachments::compose(
+        &state.orchestrator.neo4j_arc(),
+        &body.content,
+        &body.attachments,
+    )
+    .await
+    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
     match chat_manager
-        .route_user_message(&sid, &body.content, claims.as_ref())
+        .route_user_message(&sid, &content, claims.as_ref())
         .await
     {
         Ok(route) => Ok(Json(serde_json::json!({ "routed": route }))),

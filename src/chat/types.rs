@@ -172,6 +172,11 @@ impl RunnerContext {
 pub struct ChatRequest {
     /// The user's message
     pub message: String,
+    /// Ids of documents (`POST /api/documents`) attached to the message.
+    /// Folded into `message` by the API layer (see `chat::message_attachments`)
+    /// before it reaches the manager.
+    #[serde(default)]
+    pub attachments: Vec<uuid::Uuid>,
     /// Session ID to resume (optional — creates new session if None)
     #[serde(default)]
     pub session_id: Option<String>,

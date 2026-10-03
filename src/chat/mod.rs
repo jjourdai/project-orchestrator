@@ -19,6 +19,7 @@ pub mod entity_extractor;
 pub mod feedback;
 pub(crate) mod hook_ledger;
 pub mod manager;
+pub mod message_attachments;
 pub mod model_catalog;
 pub mod observation_detector;
 pub(crate) mod oob_listener;

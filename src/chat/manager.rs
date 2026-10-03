@@ -3929,6 +3929,10 @@ impl ChatManager {
             mm.record_user_message(&prompt);
         }
 
+        // Swap the `<po-attachments>` reference block for the documents' text:
+        // the stored/broadcast message keeps references only, the agent gets content.
+        let prompt = super::message_attachments::expand_for_agent(&graph, &prompt).await;
+
         // ===== PRE-ENRICHMENT PIPELINE =====
         // Enrich the prompt with context from the knowledge graph BEFORE the LLM call.
         // If the pipeline has no stages or all fail, the original prompt is used unchanged.
@@ -8983,6 +8987,7 @@ mod tests {
 
     fn runner_request(run_id: Uuid, plan_id: Uuid, task_id: Uuid) -> ChatRequest {
         ChatRequest {
+            attachments: Vec::new(),
             message: "go".into(),
             session_id: None,
             cwd: "/tmp/test".into(),
